@@ -200,6 +200,8 @@ def diarize_speakers(
     Compatible with both the new DiarizeOutput (v3.1+) and older Annotation formats.
     Automatically tries TorchCodec first, then torchaudio fallback.
     """
+    device = torch.device("cuda:0" if torch.cuda.is_available() else "cpu")
+
     if not hf_token:
         raise RuntimeError("Hugging Face token not found. Set HUGGINGFACE_TOKEN env var or pass --hf-token.")
 
@@ -215,6 +217,9 @@ def diarize_speakers(
             logging.info(f"[Pyannote] using model_id='{model_id}' and revision='{revision}'")
 
     pipeline = Pipeline.from_pretrained("pyannote/speaker-diarization-community-1", token=hf_token)
+    
+    # if torch.cuda.is_available():
+    #     pipeline.to(device)
 
     # pipeline = Pipeline.from_pretrained(
     #     model_id,

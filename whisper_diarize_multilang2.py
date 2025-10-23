@@ -34,27 +34,30 @@ from tqdm import tqdm
 
 # --- pykakasi: new API (no deprecation warnings)
 try:
-    from pykakasi import Kakasi
+    from pykakasi import kakasi
     _HAS_KAKASI = True
+    print("_HAS_KAKASI = True")
 
-    _k_hira = Kakasi()
+    _k_hira = kakasi()
     _k_hira.setMode("J", "H")  # Kanji -> Hiragana
     _k_hira.setMode("K", "H")  # Katakana -> Hiragana
     _k_hira.setMode("H", "H")  # Hiragana -> Hiragana
     _conv_hira = _k_hira.getConverter()
 
-    _k_romaji = Kakasi()
+    _k_romaji = kakasi()
     _k_romaji.setMode("J", "a")  # Kanji -> Romaji
     _k_romaji.setMode("K", "a")  # Katakana -> Romaji
     _k_romaji.setMode("H", "a")  # Hiragana -> Romaji
     _conv_romaji = _k_romaji.getConverter()
 
     def jp_with_readings(text: str):
-        hira = _conv_hira.do(text).strip()
-        roma = _conv_romaji.do(text).strip()
-        return hira, roma
+        tokens = _k_romaji.convert(text)
+        hira = " ".join(tok["hira"] for tok in _k_hira.convert(text))
+        roma = " ".join(tok["hepburn"] for tok in _k_romaji.convert(text))
+        return hira.strip(), roma.strip()
 except Exception:
     _HAS_KAKASI = False
+    print("_HAS_KAKASI = False")
     def jp_with_readings(_): return "", ""
 
 # --- Whisper, Pyannote
@@ -333,6 +336,56 @@ def build_turns(asr_segments: List[Dict], diarization: Annotation, verbose: bool
 # Writers
 # -----------------------
 
+# -----------------------
+# Offline translation (Argos Translate)
+# -----------------------
+try:
+    import argostranslate.package, argostranslate.translate
+    _HAS_ARGOS = True
+
+    def _ensure_argos_models():
+        """
+        Ensure the JA→EN and EN→ES models are installed.
+        Safe to call multiple times (no double installs).
+        """
+        try:
+            # Refresh package index and check installed packages
+            argostranslate.package.update_package_index()
+            available = argostranslate.package.get_available_packages()
+            installed = {(p.from_code, p.to_code) for p in argostranslate.package.get_installed_packages()}
+
+            def _install(from_code: str, to_code: str):
+                if (from_code, to_code) in installed:
+                    return
+                pkg = next((p for p in available if p.from_code == from_code and p.to_code == to_code), None)
+                if pkg is None:
+                    logging.warning(f"[Argos] No package found for {from_code}→{to_code}")
+                    return
+                logging.info(f"[Argos] Installing {from_code}→{to_code} model…")
+                argostranslate.package.install_from_path(pkg.download())
+
+            _install("ja", "en")
+            _install("en", "es")
+        except Exception as e:
+            logging.warning(f"[Argos] Model ensure failed: {e}")
+
+    def translate_ja_to_es(text: str) -> str:
+        """Offline Japanese → English → Spanish using Argos Translate."""
+        if not text or not text.strip():
+            return ""
+        try:
+            _ensure_argos_models()
+            en = argostranslate.translate.translate(text, "ja", "en")
+            es = argostranslate.translate.translate(en, "en", "es")
+            return es.strip()
+        except Exception as e:
+            logging.warning(f"[Argos] translate failed: {e}")
+            return ""
+except Exception:
+    _HAS_ARGOS = False
+    def translate_ja_to_es(_): return ""
+
+
 def write_json(turns: List[Turn], path: Path):
     data = [asdict(t) for t in turns]
     with open(path, "w", encoding="utf-8") as f:
@@ -390,6 +443,11 @@ def write_study(turns: List[Turn], path: Path, include_hiragana: bool = True, in
                     f.write(f"〔hiragana〕 {hira}\n")
                 if include_romaji and roma.strip():
                     f.write(f"〔romaji〕 {roma}\n")
+            # Optional offline Spanish translation (Argos) for Japanese lines
+            if (t.language == "ja" or looks_japanese(t.text)) and globals().get("_HAS_ARGOS") and globals().get("_STUDY_TRANSLATE", False):
+                es = translate_ja_to_es(t.text)
+                if es:
+                    f.write(f"〔español〕 {es}\n")
             f.write("\n")
 
 
@@ -425,6 +483,8 @@ def parse_args():
     # study options
     ap.add_argument("--study-no-hiragana", action="store_true", help="Omit hiragana line in study output.")
     ap.add_argument("--study-no-romaji", action="store_true", help="Omit romaji line in study output.")
+    ap.add_argument("--study-translate", action="store_true",
+                    help="Add Spanish translation for Japanese segments (offline via Argos Translate).")
     return ap.parse_args()
 
 
@@ -477,6 +537,9 @@ def main():
     base = in_path.with_suffix("")  # drop extension
     fmts = [f.strip().lower() for f in args.formats.split(",") if f.strip()]
     out_paths = {}
+
+    # Make study translation flag visible to writer without changing its signature
+    globals()["_STUDY_TRANSLATE"] = bool(args.study_translate)
 
     if "json" in fmts:
         p = Path(f"{base}{args.suffix}.json"); write_json(turns, p); out_paths["json"] = p

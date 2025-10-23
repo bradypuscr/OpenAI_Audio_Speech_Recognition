@@ -193,8 +193,9 @@ def diarize_speakers(
     verbose: bool = False,
 ) -> Annotation:
     """
-    Try TorchCodec path (file string) first if torchcodec is importable; otherwise preload-audio (dict).
-    If TorchCodec path fails at runtime, automatically fallback to preload-audio.
+    Diarize speakers using Pyannote.
+    Compatible with both the new DiarizeOutput (v3.1+) and older Annotation formats.
+    Automatically tries TorchCodec first, then torchaudio fallback.
     """
     if not hf_token:
         raise RuntimeError("Hugging Face token not found. Set HUGGINGFACE_TOKEN env var or pass --hf-token.")
@@ -202,25 +203,44 @@ def diarize_speakers(
     if verbose:
         logging.info(f"[Pyannote] loading pipeline: {pipeline_name}")
 
-    # NOTE: as requested, keep the explicit named argument 'token=hf_token'
-    pipeline = Pipeline.from_pretrained(pipeline_name, token=hf_token)
+    # Parse model_id and revision from the pipeline_name string
+    model_id = pipeline_name
+    revision = None
+    if "@" in model_id:
+        model_id, revision = model_id.split("@", 1)
+        if verbose:
+            logging.info(f"[Pyannote] using model_id='{model_id}' and revision='{revision}'")
 
-    # Decide which input format to try first
+    pipeline = Pipeline.from_pretrained("pyannote/speaker-diarization-community-1", token=hf_token)
+
+    # pipeline = Pipeline.from_pretrained(
+    #     model_id,
+    #     revision=revision,  # Pass revision as a separate keyword
+    #     token=hf_token
+    # )
+
     try_torchcodec_first = _has_torchcodec() and isinstance(audio_input, str)
     if verbose:
         logging.info(f"[Pyannote] torchcodec_available={_has_torchcodec()} | input_is_path={isinstance(audio_input, str)}")
 
-    # 1) TorchCodec path (if available and audio_input is a path)
+    def _extract_annotation(result):
+        """Handle both old (Annotation) and new (DiarizeOutput) pipeline results."""
+        if hasattr(result, "annotation"):
+            return result.annotation
+        return result
+
+    # 1) Try TorchCodec path first
     if try_torchcodec_first:
         try:
             if verbose:
                 logging.info("[Pyannote] trying TorchCodec path (file string input)")
-            return pipeline(audio_input)
+            result = pipeline(audio_input)
+            return _extract_annotation(result)
         except Exception as e:
             if verbose:
                 logging.warning(f"[Pyannote] TorchCodec path failed ({e.__class__.__name__}: {e}); falling back to preloaded-audio")
 
-    # 2) Fallback: preloaded-audio dict
+    # 2) Fallback to preloaded torchaudio
     if isinstance(audio_input, str):
         audio_dict = load_audio_ta(audio_input)
     else:
@@ -228,12 +248,46 @@ def diarize_speakers(
 
     if verbose:
         logging.info("[Pyannote] using preloaded-audio (torchaudio) path")
-    return pipeline(audio_dict)
+    result = pipeline(audio_dict)
+    return _extract_annotation(result)
 
 
-def assign_speakers_to_asr(asr: List[Dict], diarization: Annotation) -> List[Tuple[Dict, str]]:
-    assigned = []
-    turns = list(diarization.itertracks(yield_label=True))  # (Segment, track, label)
+def assign_speakers_to_asr(asr: List[Dict], diarization) -> List[Tuple[Dict, str]]:
+    """
+    Map speakers from pyannote output to ASR segments.
+    Accepts:
+      - pyannote.core.Annotation
+      - wrapper with .annotation (Annotation)
+      - wrapper with .speaker_diarization iterable of (Segment, speaker) pairs
+    """
+
+    # Case 1: already an Annotation
+    if hasattr(diarization, "itertracks"):
+        ann = diarization
+
+    # Case 2: wrapper exposing .annotation -> Annotation
+    elif hasattr(diarization, "annotation"):
+        ann = diarization.annotation
+        if not hasattr(ann, "itertracks"):
+            raise TypeError("Unwrapped .annotation is not an Annotation-like object.")
+
+    # Case 3: wrapper exposing .speaker_diarization -> build an Annotation
+    elif hasattr(diarization, "speaker_diarization"):
+        ann = Annotation()
+        for turn, speaker in diarization.speaker_diarization:
+            # `turn` is a pyannote.core.Segment
+            ann[turn] = str(speaker)
+
+    else:
+        raise TypeError(
+            f"Unexpected diarization type: {type(diarization)}. "
+            "Expected Annotation, or an object with .annotation or .speaker_diarization."
+        )
+
+    # Now proceed uniformly with an Annotation
+    turns = list(ann.itertracks(yield_label=True))  # (Segment, track, label)
+    assigned: List[Tuple[Dict, str]] = []
+
     for seg in asr:
         s_start, s_end = seg["start"], seg["end"]
         best_label, best_olap = "Unknown", 0.0
@@ -243,8 +297,9 @@ def assign_speakers_to_asr(asr: List[Dict], diarization: Annotation) -> List[Tup
                 best_olap = ol
                 best_label = label
         assigned.append((seg, best_label))
-    return assigned
 
+    return assigned
+    
 
 def detect_language_for_text(text: str) -> Tuple[str, float]:
     if not text.strip():
@@ -362,8 +417,8 @@ def parse_args():
     ap.add_argument("--beam-size", type=int, default=5, help="Beam size for decoding.")
     ap.add_argument("--no-vad", action="store_true", help="Disable VAD filter.")
     ap.add_argument("--hf-token", default=os.environ.get("HUGGINGFACE_TOKEN", ""), help="Hugging Face token.")
-    ap.add_argument("--diarization-pipeline", default="pyannote/speaker-diarization-3.1",
-                    help="Pyannote pipeline repo id.")
+    ap.add_argument("--diarization-pipeline", default="pyannote/speaker-diarization@2.1",
+                    help="Pyannote pipeline repo id (default: pyannote/speaker-diarization@2.1).")
     ap.add_argument("--preload-audio", action="store_true",
                     help="Force preloaded-audio (torchaudio) path for diarization (bypass TorchCodec).")
     ap.add_argument("-v", "--verbose", action="store_true", help="Verbose logging + progress bars.")
@@ -411,6 +466,10 @@ def main():
         verbose=args.verbose
     )
 
+    # Unwrap DiarizeOutput if needed
+    if hasattr(diar, "annotation"):
+        diar = diar.annotation
+
     # Merge + per-segment language ID
     turns = build_turns(asr_segments, diar, verbose=args.verbose)
 
@@ -447,4 +506,4 @@ if __name__ == "__main__":
     main()
 
 
-C:\Users\epena\AppData\Roaming\Python\Python311\site-packages\~orch
+# C:\Users\epena\AppData\Roaming\Python\Python311\site-packages\~orch

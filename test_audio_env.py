@@ -1,6 +1,45 @@
 """
 Full environment sanity test for Whisper + Pyannote + TorchCodec + CUDA + Torchaudio
 
+
+sudo apt update && sudo apt upgrade -y
+sudo apt install curl wget git -y
+wget https://repo.anaconda.com/miniconda/Miniconda3-latest-Linux-x86_64.sh -O ~/miniconda.sh
+bash ~/miniconda.sh
+source ~/.bashrc
+conda tos accept --override-channels --channel https://repo.anaconda.com/pkgs/main
+conda tos accept --override-channels --channel https://repo.anaconda.com/pkgs/r
+
+
+conda deactivate
+conda env remove --name py312 -y
+conda clean --all -y
+
+conda create -n py312 python=3.12 -y
+conda activate py312
+
+conda install "ffmpeg<8"
+pip install torch torchvision --index-url https://download.pytorch.org/whl/cu126
+pip install torchaudio --index-url https://download.pytorch.org/whl/cu126
+pip install torchcodec --index-url=https://download.pytorch.org/whl/cu126
+pip install pyannote.audio
+
+
+
+
+
+print(torch.cuda.is_available())
+
+
+sudo apt install -y nvidia-cuda-toolkit
+conda uninstall ffmpeg
+conda install "ffmpeg<6" -c conda-forge
+conda install libiconv -c conda-forge
+pip install torchcodec --index-url=https://download.pytorch.org/whl/cu128
+pip install pykakasi faster-whisper argostranslate langid
+
+
+
 Usage:
     python test_audio_env.py --hf-token <YOUR_HUGGINGFACE_TOKEN>
 """
@@ -146,7 +185,6 @@ try:
     else:
         pipeline = Pipeline.from_pretrained("pyannote/speaker-diarization-3.1", token=hf_token)
         device = "cuda" if torch and torch.cuda.is_available() else "cpu"
-        pipeline.to(torch.device(device))
         pipeline.to(torch.device(device))
         try:
             # For older pyannote versions

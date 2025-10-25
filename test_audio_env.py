@@ -64,25 +64,22 @@ parser.add_argument("--hf-token", type=str, default=None, help="Hugging Face acc
 args = parser.parse_args()
 token = args.hf_token
 
-
 # ---------------------------------------------------------
 # UTILITIES
 # ---------------------------------------------------------
 def print_div(title):
     print(f"\n=== {title} ===")
 
-
 def check_pkg(name):
     """Try importing a package and print its version."""
     try:
         mod = importlib.import_module(name)
         ver = getattr(mod, "__version__", "n/a")
-        print(f"[OK] {name:15s} v{ver}")
+        print(f"[OK]  {name:15s} v{ver}")
         return mod
     except Exception as e:
         print(f"[FAIL] {name:15s} -> {type(e).__name__}: {e}")
         return None
-
 
 cuda_results = {}
 
@@ -92,7 +89,6 @@ cuda_results = {}
 print_div("PYTHON & PATH")
 print(f"Python: {sys.version}")
 print(f"PATH   : {os.environ.get('PATH', '')[:120]}...\n")
-
 
 # ---------------------------------------------------------
 # CORE LIBRARIES
@@ -106,7 +102,6 @@ langid = check_pkg("langid")
 pykakasi = check_pkg("pykakasi")
 # torchcodec = check_pkg("torchcodec")  # optional
 
-
 # ---------------------------------------------------------
 # TORCH / CUDA TEST
 # ---------------------------------------------------------
@@ -118,16 +113,16 @@ if torch:
     device = "cuda" if torch.cuda.is_available() else "cpu"
 
     try:
-        x = torch.rand(2000, 2000, device=device)
-        y = x @ x
-        if device == "cuda":
-            torch.cuda.synchronize()
+        with torch.no_grad():
+            x = torch.rand(2000, 2000, device=device)
+            y = x @ x
+            if device == "cuda":
+                torch.cuda.synchronize()
         print("✅ Tensor matmul successful on", device)
         cuda_results["torch"] = device == "cuda"
     except Exception as e:
         print("❌ Torch CUDA test failed:", e)
         cuda_results["torch"] = False
-
 
 # ---------------------------------------------------------
 # CUDNN LIBRARY TEST
@@ -141,16 +136,18 @@ try:
     print("cuDNN available:", cudnn_enabled)
     print("cuDNN version  :", cudnn.version())
 
-    # Attempt to locate libcudnn libraries
+    # Attempt to locate libcudnn libraries (include bundled path that PyTorch wheels use)
     conda_prefix = os.environ.get("CONDA_PREFIX", "")
+    bundled_cudnn = os.path.join(conda_prefix, "lib", "python3.12", "site-packages", "nvidia", "cudnn", "lib")
     cudnn_libs = (
         glob.glob("/usr/lib/x86_64-linux-gnu/libcudnn*.so*")
         + glob.glob(f"{conda_prefix}/lib/libcudnn*.so*")
         + glob.glob("/usr/local/cuda/lib64/libcudnn*.so*")
+        + glob.glob(os.path.join(bundled_cudnn, "libcudnn*.so*"))
     )
 
     if cudnn_libs:
-        print(f"Found cuDNN libraries: {cudnn_libs[:2]}{'...' if len(cudnn_libs)>2 else ''}")
+        print(f"Found cuDNN libraries (sample): {cudnn_libs[:2]}{'...' if len(cudnn_libs)>2 else ''}")
         try:
             _ = ctypes.CDLL(cudnn_libs[0])
             print("✅ cuDNN shared library successfully loaded.")
@@ -162,10 +159,12 @@ try:
     # Tiny conv2d test to verify GPU execution
     if torch.cuda.is_available():
         device = torch.device("cuda")
-        model = torch.nn.Conv2d(3, 8, kernel_size=3, padding=1).to(device)
-        inp = torch.randn(1, 3, 64, 64, device=device)
-        with torch.backends.cudnn.flags(enabled=True):
-            out = model(inp)
+        with torch.no_grad():
+            model = torch.nn.Conv2d(3, 8, kernel_size=3, padding=1).to(device)
+            inp = torch.randn(1, 3, 64, 64, device=device)
+            with torch.backends.cudnn.flags(enabled=True):
+                out = model(inp)
+            torch.cuda.synchronize()
         print(f"✅ cuDNN convolution test OK (output shape {out.shape})")
         cuda_results["cudnn"] = True
     else:
@@ -176,20 +175,23 @@ except Exception as e:
     print("❌ cuDNN test failed:", e)
     cuda_results["cudnn"] = False
 
-
 # ---------------------------------------------------------
 # CUDNN SYMBOL INTEGRITY TEST
 # ---------------------------------------------------------
 print_div("CUDNN SYMBOL INTEGRITY TEST")
 
 def test_cudnn_symbols():
-    possible_libs = []
     conda_prefix = os.environ.get("CONDA_PREFIX", "")
+    bundled = os.path.join(conda_prefix, "lib", "python3.12", "site-packages", "nvidia", "cudnn", "lib")
+
     search_paths = [
         "/usr/lib/x86_64-linux-gnu/",
         f"{conda_prefix}/lib/",
         "/usr/local/cuda/lib64/",
+        bundled,  # <-- include PyTorch-bundled cuDNN
     ]
+
+    possible_libs = []
     for path in search_paths:
         possible_libs += glob.glob(os.path.join(path, "libcudnn_ops.so*"))
         possible_libs += glob.glob(os.path.join(path, "libcudnn.so*"))
@@ -219,7 +221,6 @@ def test_cudnn_symbols():
 
 cuda_results["cudnn_symbols"] = test_cudnn_symbols()
 
-
 # ---------------------------------------------------------
 # TORCHAUDIO TEST (I/O + GPU Transform)
 # ---------------------------------------------------------
@@ -231,11 +232,11 @@ if torchaudio and torch:
         sample_rate = 16000
         t = torch.linspace(0, 1, sample_rate)
         waveform = 0.1 * torch.sin(2 * math.pi * 440 * t).unsqueeze(0)
-        backends = ["soundfile", "sox_io", "ffmpeg"]
         test_file = Path("test_backend.wav")
 
         print("\n[Backend Save/Load Test]")
-        for backend in backends:
+        # Save with "soundfile" or "sox_io"; use "ffmpeg" for load-only (many builds can't save)
+        for backend in ["soundfile", "sox_io"]:
             try:
                 torchaudio.save(test_file, waveform, sample_rate, backend=backend)
                 loaded, sr = torchaudio.load(test_file, backend=backend)
@@ -244,12 +245,21 @@ if torchaudio and torch:
             except Exception as e:
                 print(f"❌ {backend:9s}: {e}")
 
+        # Optional: try loading with ffmpeg backend if present
+        try:
+            loaded, sr = torchaudio.load(test_file, backend="ffmpeg")
+            print(f"✅ {'ffmpeg':9s}: load OK — {loaded.shape[1]} samples @ {sr} Hz")
+        except Exception as e:
+            print(f"ℹ️ {'ffmpeg':9s}: load skipped or unavailable ({e})")
+
         # GPU Transform test
         print("\n[GPU Transform Test]")
         if torch.cuda.is_available():
             spec = torchaudio.transforms.MelSpectrogram(sample_rate=sample_rate, n_mels=64).to("cuda")
             waveform_gpu = waveform.to("cuda")
-            out = spec(waveform_gpu)
+            with torch.no_grad():
+                out = spec(waveform_gpu)
+                torch.cuda.synchronize()
             print(f"✅ MelSpectrogram executed on device: {out.device}")
             cuda_results["torchaudio"] = True
         else:
@@ -259,7 +269,6 @@ if torchaudio and torch:
     except Exception as e:
         print("⚠️ Torchaudio I/O test failed:", e)
         cuda_results["torchaudio"] = False
-
 
 # ---------------------------------------------------------
 # PYANNOTE PIPELINE TEST
@@ -272,7 +281,8 @@ try:
     if not token:
         print("⚠️ No --hf-token provided — skipping model load.")
     else:
-        pipeline = Pipeline.from_pretrained("pyannote/speaker-diarization-3.1", use_auth_token=token)
+        # Use modern kwarg name:
+        pipeline = Pipeline.from_pretrained("pyannote/speaker-diarization-3.1", token=token)
         device = "cuda" if torch and torch.cuda.is_available() else "cpu"
         pipeline.to(torch.device(device))
         try:
@@ -284,7 +294,6 @@ try:
 except Exception as e:
     print("PyAnnote test error:", e)
 
-
 # ---------------------------------------------------------
 # FASTER WHISPER TEST
 # ---------------------------------------------------------
@@ -292,14 +301,14 @@ print_div("FASTER WHISPER TEST")
 cuda_results["whisper"] = False
 try:
     from faster_whisper import WhisperModel
-
-    device = "cuda" if torch and torch.cuda.is_available() else "cpu"
-    model = WhisperModel("tiny", device=device, compute_type="float16")
-    print(f"✅ Whisper model loaded on {device}")
-    cuda_results["whisper"] = device == "cuda"
+    use_cuda = bool(torch and torch.cuda.is_available())
+    compute_type = "float16" if use_cuda else "int8"  # avoid fp16 on CPU
+    device = "cuda" if use_cuda else "cpu"
+    model = WhisperModel("tiny", device=device, compute_type=compute_type)
+    print(f"✅ Whisper model loaded on {device} (compute_type={compute_type})")
+    cuda_results["whisper"] = use_cuda
 except Exception as e:
     print("Whisper test error:", e)
-
 
 # ---------------------------------------------------------
 # SUMMARY

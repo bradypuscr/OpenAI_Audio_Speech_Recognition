@@ -213,6 +213,8 @@ def transcribe_audio(
     compute_type: str = "float16",
     beam_size: int = 5,
     vad_filter: bool = True,
+    word_timestamps: bool = True,
+    condition_on_previous_text: bool = True,
     verbose: bool = False,
 ) -> List[Dict]:
     # Auto device: CUDA if available, else CPU — independent of compute_type
@@ -227,8 +229,8 @@ def transcribe_audio(
         language=None,          # auto-detect; Whisper handles code-switching
         beam_size=beam_size,
         vad_filter=vad_filter,
-        word_timestamps=False,  # set True if you want word-level (slower)
-        condition_on_previous_text=False,
+        word_timestamps=word_timestamps,
+        condition_on_previous_text=condition_on_previous_text,
     )
 
     segments = []
@@ -268,7 +270,12 @@ def diarize_speakers(
         if verbose:
             logging.info(f"[Pyannote] using model_id='{model_id}' and revision='{revision}'")
 
-    pipeline = Pipeline.from_pretrained("pyannote/speaker-diarization-community-1", token=hf_token)
+    # honor the user-provided pipeline (default: 3.1)
+    pipeline = Pipeline.from_pretrained(
+        model_id,
+        revision=revision,  # may be None
+        token=hf_token
+    )
     
     device = "cuda" if torch and torch.cuda.is_available() else "cpu"
     pipeline.to(torch.device(device))
@@ -527,11 +534,15 @@ def parse_args():
     ap.add_argument("--beam-size", type=int, default=5, help="Beam size for decoding.")
     ap.add_argument("--no-vad", action="store_true", help="Disable VAD filter.")
     ap.add_argument("--hf-token", default=os.environ.get("HUGGINGFACE_TOKEN", ""), help="Hugging Face token.")
-    ap.add_argument("--diarization-pipeline", default="pyannote/speaker-diarization@2.1",
-                    help="Pyannote pipeline repo id (default: pyannote/speaker-diarization@2.1).")
+    ap.add_argument("--diarization-pipeline", default="pyannote/speaker-diarization-3.1",
+                    help="Pyannote pipeline repo id (default: pyannote/speaker-diarization-3.1).")
     ap.add_argument("--preload-audio", action="store_true",
                     help="Force preloaded-audio (torchaudio) path for diarization (bypass TorchCodec).")
     ap.add_argument("-v", "--verbose", action="store_true", help="Verbose logging + progress bars.")
+    # decoding controls (default ON; add flags to disable)
+    ap.add_argument("--no-word-timestamps", action="store_true", help="Disable word-level timestamps (defaults to ON).")
+    ap.add_argument("--no-condition-on-previous-text", action="store_true",
+                    help="Disable conditioning on previous text (defaults to ON).")
     # study options
     ap.add_argument("--study-no-hiragana", action="store_true", help="Omit hiragana line in study output.")
     ap.add_argument("--study-no-romaji", action="store_true", help="Omit romaji line in study output.")
@@ -559,6 +570,8 @@ def main():
         compute_type=args.compute_type,
         beam_size=args.beam_size,
         vad_filter=not args.no_vad,
+        word_timestamps=not args.no_word_timestamps,
+        condition_on_previous_text=not args.no_condition_on_previous_text,
         verbose=args.verbose
     )
 

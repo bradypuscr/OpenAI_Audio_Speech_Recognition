@@ -11,22 +11,56 @@ Whisper + Pyannote diarization + per-segment language ID (langid)
 - TorchCodec path (preferred) with automatic fallback to preloaded-audio if unavailable
 """
 
+"""
+--------------- ENVIRONMENT SETUP --------------- 
+# --- fresh start
+conda deactivate
+conda env remove --name py312 -y
+conda clean --all -y
+
+conda create -n py312 python=3.12 -y
+conda activate py312
+
+# --- multimedia dependencies
+conda install "ffmpeg<8" -y
+
+# --- ✅ install PyTorch stack with matching CUDA runtime (no full toolkit)
+pip install torch torchvision torchaudio --index-url https://download.pytorch.org/whl/cu126
+
+# --- diarization and audio utils
+pip install pyannote.audio pykakasi faster-whisper argostranslate langid
+
+
+# conda install -c conda-forge cudnn
+mkdir -p "$CONDA_PREFIX/etc/conda/activate.d"
+cat > "$CONDA_PREFIX/etc/conda/activate.d/99-cudnn-path.sh" <<'SH'
+# Ensure PyTorch uses the bundled cuDNN first
+export LD_LIBRARY_PATH="$CONDA_PREFIX/lib/python3.12/site-packages/nvidia/cudnn/lib:$LD_LIBRARY_PATH"
+SH
+
+# reload the env
+conda deactivate && conda activate py312
+
+"""
+
 import os
 import sys
 import json
 import argparse
 import logging
+import subprocess
+import numpy as np
 from pathlib import Path
 from dataclasses import dataclass, asdict
 from typing import List, Dict, Tuple, Union
 
 import warnings
-warnings.filterwarnings(
-    "ignore",
-    message="pkg_resources is deprecated as an API",
-    category=UserWarning,
-    module="ctranslate2",
-)
+warnings.filterwarnings("ignore", message="pkg_resources is deprecated as an API", category=UserWarning, module="ctranslate2",)
+warnings.filterwarnings("ignore", message="The given NumPy array is not writable")
+warnings.filterwarnings("ignore", module="pyannote.audio.utils.reproducibility", category=UserWarning)
+warnings.filterwarnings("ignore", message="std\\(\\): degrees of freedom is <= 0")
+warnings.filterwarnings("ignore", category=DeprecationWarning, module="pykakasi")
+
 
 import langid
 import pandas as pd
@@ -36,8 +70,6 @@ from tqdm import tqdm
 try:
     from pykakasi import kakasi
     _HAS_KAKASI = True
-    print("_HAS_KAKASI = True")
-
     _k_hira = kakasi()
     _k_hira.setMode("J", "H")  # Kanji -> Hiragana
     _k_hira.setMode("K", "H")  # Katakana -> Hiragana
@@ -57,7 +89,6 @@ try:
         return hira.strip(), roma.strip()
 except Exception:
     _HAS_KAKASI = False
-    print("_HAS_KAKASI = False")
     def jp_with_readings(_): return "", ""
 
 # --- Whisper, Pyannote
@@ -135,6 +166,27 @@ def load_audio_ta(path: str, target_sr: int = 16000) -> dict:
     if wav.shape[0] > 1:
         wav = wav.mean(dim=0, keepdim=True)  # mono
     return {"waveform": wav, "sample_rate": sr}
+
+def load_audio_ffmpeg(path: str, target_sr: int = 16000) -> dict:
+    """
+    Decode with FFmpeg CLI to mono float32 PCM at target_sr.
+    Returns a dict compatible with pyannote's preloaded-audio path.
+    """
+    # ffmpeg -i input -f f32le -ac 1 -ar 16000 pipe:1
+    cmd = [
+        "ffmpeg", "-nostdin", "-threads", "0", "-i", path,
+        "-vn", "-ac", "1", "-ar", str(target_sr),
+        "-f", "f32le", "pipe:1"
+    ]
+    proc = subprocess.run(cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE, check=False)
+    if proc.returncode != 0:
+        raise RuntimeError(f"ffmpeg decode failed (code {proc.returncode}): {proc.stderr.decode(errors='ignore')[:500]}")
+    # Convert raw bytes → float32 mono tensor
+    audio = np.frombuffer(proc.stdout, dtype=np.float32).copy()
+    if audio.size == 0:
+        raise RuntimeError("ffmpeg produced no audio samples.")
+    wav = torch.from_numpy(audio).unsqueeze(0)  # (1, T) mono
+    return {"waveform": wav, "sample_rate": target_sr}
 
 
 # -----------------------
@@ -218,18 +270,12 @@ def diarize_speakers(
 
     pipeline = Pipeline.from_pretrained("pyannote/speaker-diarization-community-1", token=hf_token)
     
-    # if torch.cuda.is_available():
-    #     pipeline.to(device)
+    device = "cuda" if torch and torch.cuda.is_available() else "cpu"
+    pipeline.to(torch.device(device))
 
-    # pipeline = Pipeline.from_pretrained(
-    #     model_id,
-    #     revision=revision,  # Pass revision as a separate keyword
-    #     token=hf_token
-    # )
-
-    try_torchcodec_first = _has_torchcodec() and isinstance(audio_input, str)
+    try_ffmpeg_first = isinstance(audio_input, str)
     if verbose:
-        logging.info(f"[Pyannote] torchcodec_available={_has_torchcodec()} | input_is_path={isinstance(audio_input, str)}")
+        logging.info(f"[Pyannote] ffmpeg_cli_available=True | input_is_path={isinstance(audio_input, str)}")
 
     def _extract_annotation(result):
         """Handle both old (Annotation) and new (DiarizeOutput) pipeline results."""
@@ -237,16 +283,17 @@ def diarize_speakers(
             return result.annotation
         return result
 
-    # 1) Try TorchCodec path first
-    if try_torchcodec_first:
+    # 1) Try FFmpeg CLI path first (decode-on-the-fly to tensor)
+    if try_ffmpeg_first:
         try:
             if verbose:
-                logging.info("[Pyannote] trying TorchCodec path (file string input)")
-            result = pipeline(audio_input)
+                logging.info("[Pyannote] trying FFmpeg CLI decode path")
+            audio_dict = load_audio_ffmpeg(audio_input)  # mono float32 16k
+            result = pipeline(audio_dict)
             return _extract_annotation(result)
         except Exception as e:
             if verbose:
-                logging.warning(f"[Pyannote] TorchCodec path failed ({e.__class__.__name__}: {e}); falling back to preloaded-audio")
+                logging.warning(f"[Pyannote] FFmpeg path failed ({e.__class__.__name__}: {e}); falling back to torchaudio preload")
 
     # 2) Fallback to preloaded torchaudio
     if isinstance(audio_input, str):

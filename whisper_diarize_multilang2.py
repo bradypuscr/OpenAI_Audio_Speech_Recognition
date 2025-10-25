@@ -656,7 +656,8 @@ def main():
         except Exception as e:
             logging.warning(f"[Preprocess] Denoise failed: {e}. Continuing with original input.")
 
-    # Transcribe (Whisper)
+    # Transcribe (Whisper) with timing
+    _t0_asr = time.perf_counter()
     asr_segments = transcribe_audio(
         working_input,
         model_size=args.model_size,

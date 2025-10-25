@@ -1,5 +1,5 @@
 """
-Quick dependency check for Whisper + Pyannote + TorchCodec + CUDA + Torchaudio
+Full environment sanity test for Whisper + Pyannote + TorchCodec + CUDA + Torchaudio
 
 Usage:
     python test_audio_env.py --hf-token <YOUR_HUGGINGFACE_TOKEN>
@@ -11,7 +11,9 @@ import sys
 import math
 import argparse
 from pathlib import Path
+import warnings
 
+warnings.filterwarnings("ignore", message="The 'backend' parameter is not used by TorchCodec")
 
 # ---------------------------------------------------------
 # CLI ARGUMENTS
@@ -37,7 +39,20 @@ def check_pkg(name):
         return None
 
 
-print("=== PYTHON & PATH ===")
+def print_div(title):
+    print(f"\n=== {title} ===")
+
+
+def cuda_status(torch):
+    return torch.cuda.is_available(), getattr(torch.version, "cuda", "n/a"), torch.backends.cudnn.version()
+
+
+cuda_results = {}
+
+# ---------------------------------------------------------
+# PYTHON & PATH
+# ---------------------------------------------------------
+print_div("PYTHON & PATH")
 print(f"Python: {sys.version}")
 print(f"PATH   : {os.environ.get('PATH', '')[:120]}...\n")
 
@@ -45,7 +60,7 @@ print(f"PATH   : {os.environ.get('PATH', '')[:120]}...\n")
 # ---------------------------------------------------------
 # CORE LIBRARIES
 # ---------------------------------------------------------
-print("=== CORE LIBRARIES ===")
+print_div("CORE LIBRARIES")
 torch = check_pkg("torch")
 torchaudio = check_pkg("torchaudio")
 pyannote = check_pkg("pyannote.audio")
@@ -56,21 +71,31 @@ pykakasi = check_pkg("pykakasi")
 
 
 # ---------------------------------------------------------
-# TORCH / CUDA
+# TORCH / CUDA TEST
 # ---------------------------------------------------------
-print("\n=== TORCH / CUDA TEST ===")
+print_div("TORCH / CUDA TEST")
 if torch:
-    print("CUDA available:", torch.cuda.is_available())
-    print("CUDA version  :", getattr(torch.version, "cuda", "n/a"))
-    print("cuDNN version :", torch.backends.cudnn.version())
-    x = torch.rand(2, 2).to("cuda" if torch.cuda.is_available() else "cpu")
-    print("Tensor device :", x.device)
+    is_cuda, cuda_ver, cudnn_ver = cuda_status(torch)
+    print("CUDA available:", is_cuda)
+    print("CUDA version  :", cuda_ver)
+    print("cuDNN version :", cudnn_ver)
+
+    device = "cuda" if is_cuda else "cpu"
+    try:
+        x = torch.rand(2000, 2000, device=device)
+        y = x @ x
+        torch.cuda.synchronize() if is_cuda else None
+        print("✅ Tensor matmul successful on", device)
+        cuda_results["torch"] = is_cuda
+    except Exception as e:
+        print("❌ Torch CUDA test failed:", e)
+        cuda_results["torch"] = False
 
 
 # ---------------------------------------------------------
-# TORCHAUDIO TEST (v2.9+ compatible)
+# TORCHAUDIO TEST (I/O + GPU Transform)
 # ---------------------------------------------------------
-print("\n=== TORCHAUDIO TEST ===")
+print_div("TORCHAUDIO TEST")
 
 if torchaudio and torch:
     print("TorchAudio version:", torchaudio.__version__)
@@ -90,52 +115,64 @@ if torchaudio and torch:
                 test_file.unlink(missing_ok=True)
             except Exception as e:
                 print(f"❌ {backend:9s}: {e}")
-        print("✔️  Torchaudio sanity check done.")
+
+        # GPU Transform test
+        print("\n[GPU Transform Test]")
+        if torch.cuda.is_available():
+            spec = torchaudio.transforms.MelSpectrogram(sample_rate=sample_rate, n_mels=64).to("cuda")
+            waveform_gpu = waveform.to("cuda")
+            out = spec(waveform_gpu)
+            print(f"✅ MelSpectrogram executed on device: {out.device}")
+            cuda_results["torchaudio"] = True
+        else:
+            print("⚠️ CUDA not available for Torchaudio transforms.")
+            cuda_results["torchaudio"] = False
+
     except Exception as e:
-        print("⚠️  Torchaudio I/O test failed:", e)
-
-
-# ---------------------------------------------------------
-# TORCHCODEC TEST (optional)
-# ---------------------------------------------------------
-# print("\n=== TORCHCODEC TEST ===")
-# try:
-#     import torchcodec
-#     _ = dir(torchcodec)
-#     print("TorchCodec import successful.")
-# except Exception as e:
-#     print("TorchCodec load error:", e)
+        print("⚠️ Torchaudio I/O test failed:", e)
+        cuda_results["torchaudio"] = False
 
 
 # ---------------------------------------------------------
 # PYANNOTE PIPELINE TEST
 # ---------------------------------------------------------
-print("\n=== PYANNOTE PIPELINE TEST ===")
+print_div("PYANNOTE PIPELINE TEST")
+cuda_results["pyannote"] = False
 try:
     from pyannote.audio import Pipeline
 
     if not hf_token:
-        print("⚠️  No --hf-token provided — skipping model load.")
+        print("⚠️ No --hf-token provided — skipping model load.")
     else:
         pipeline = Pipeline.from_pretrained("pyannote/speaker-diarization-3.1", token=hf_token)
-        print("Pyannote diarization pipeline loaded OK.")
+        device = "cuda" if torch and torch.cuda.is_available() else "cpu"
+        pipeline.to(torch.device(device))
+        pipeline.to(torch.device(device))
+        try:
+            # For older pyannote versions
+            first_param = next(pipeline.parameters())
+            print("✅ PyAnnote pipeline loaded on:", first_param.device)
+        except Exception:
+            # For newer pyannote >= 3.3 where .parameters() doesn't exist
+            print(f"✅ PyAnnote pipeline configured for device: {device}")
+        cuda_results["pyannote"] = device == "cuda"
+
 except Exception as e:
-    print("Pyannote test error:", e)
+    print("PyAnnote test error:", e)
 
 
 # ---------------------------------------------------------
 # FASTER WHISPER TEST
 # ---------------------------------------------------------
-print("\n=== FASTER WHISPER TEST ===")
+print_div("FASTER WHISPER TEST")
+cuda_results["whisper"] = False
 try:
     from faster_whisper import WhisperModel
 
-    model = WhisperModel(
-        "tiny",
-        device="cuda" if torch and torch.cuda.is_available() else "cpu",
-        compute_type="float16",
-    )
-    print("Whisper model loaded OK.")
+    device = "cuda" if torch and torch.cuda.is_available() else "cpu"
+    model = WhisperModel("tiny", device=device, compute_type="float16")
+    print(f"✅ Whisper model loaded on {device}")
+    cuda_results["whisper"] = device == "cuda"
 except Exception as e:
     print("Whisper test error:", e)
 
@@ -143,5 +180,13 @@ except Exception as e:
 # ---------------------------------------------------------
 # SUMMARY
 # ---------------------------------------------------------
-print("\n=== SUMMARY ===")
-print("If all sections above show [OK] and no exceptions, your environment is ready ✅")
+print_div("SUMMARY")
+
+for k, used_cuda in cuda_results.items():
+    status = "✅ GPU" if used_cuda else "⚠️ CPU"
+    print(f"{k:10s}: {status}")
+
+if all(cuda_results.values()):
+    print("\n🎉 All components successfully used CUDA!")
+else:
+    print("\n⚠️ Some components ran on CPU. Check above for details.")

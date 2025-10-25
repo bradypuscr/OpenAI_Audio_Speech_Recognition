@@ -9,11 +9,14 @@ Whisper + Pyannote diarization + per-segment language ID (langid)
 - Outputs: JSON / SRT / VTT / TXT / CSV / STUDY next to the input file (with a suffix)
 - GPU ready: auto-detects CUDA and uses it when available
 - TorchCodec path (preferred) with automatic fallback to preloaded-audio if unavailable
+
+Tip (optional pre-clean):
+  ffmpeg -i in.mp4 -vn -ac 1 -ar 16000 -af "arnndn=m=rnnoise-models/somnolent_hogwash.rnnn" clean.wav
 """
 
 """
---------------- ENVIRONMENT SETUP --------------- 
-# --- fresh start
+--------------- ENVIRONMENT SETUP ---------------
+# fresh start
 conda deactivate
 conda env remove --name py312 -y
 conda clean --all -y
@@ -21,17 +24,16 @@ conda clean --all -y
 conda create -n py312 python=3.12 -y
 conda activate py312
 
-# --- multimedia dependencies
+# multimedia dependencies
 conda install "ffmpeg<8" -y
 
-# --- ✅ install PyTorch stack with matching CUDA runtime (no full toolkit)
+# ✅ install PyTorch stack with matching CUDA runtime (no full toolkit)
 pip install torch torchvision torchaudio --index-url https://download.pytorch.org/whl/cu126
 
-# --- diarization and audio utils
-pip install pyannote.audio pykakasi faster-whisper argostranslate langid
+# diarization and audio utils
+pip install pyannote.audio pykakasi faster-whisper argostranslate langid pandas tqdm
 
-
-# conda install -c conda-forge cudnn
+# optional: ensure bundled cuDNN takes precedence (Linux/WSL)
 mkdir -p "$CONDA_PREFIX/etc/conda/activate.d"
 cat > "$CONDA_PREFIX/etc/conda/activate.d/99-cudnn-path.sh" <<'SH'
 # Ensure PyTorch uses the bundled cuDNN first
@@ -40,7 +42,6 @@ SH
 
 # reload the env
 conda deactivate && conda activate py312
-
 """
 
 import os
@@ -49,10 +50,12 @@ import json
 import argparse
 import logging
 import subprocess
+import tempfile
+import textwrap
 import numpy as np
 from pathlib import Path
 from dataclasses import dataclass, asdict
-from typing import List, Dict, Tuple, Union
+from typing import List, Dict, Tuple, Union, Optional
 
 import warnings
 warnings.filterwarnings("ignore", message="pkg_resources is deprecated as an API", category=UserWarning, module="ctranslate2",)
@@ -61,12 +64,11 @@ warnings.filterwarnings("ignore", module="pyannote.audio.utils.reproducibility",
 warnings.filterwarnings("ignore", message="std\\(\\): degrees of freedom is <= 0")
 warnings.filterwarnings("ignore", category=DeprecationWarning, module="pykakasi")
 
-
 import langid
 import pandas as pd
 from tqdm import tqdm
 
-# --- pykakasi: new API (no deprecation warnings)
+# --- pykakasi
 try:
     from pykakasi import kakasi
     _HAS_KAKASI = True
@@ -108,10 +110,27 @@ def _has_torchcodec() -> bool:
 import torch
 import torchaudio
 
-
 # -----------------------
 # Utilities
 # -----------------------
+
+# ---- version helper (robust to packages without __version__)
+def _pkg_version(dist_name: str, import_name: str | None = None):
+    """
+    Prefer importlib.metadata version by distribution name (pip name),
+    fall back to importing the module and reading __version__ if present.
+    """
+    try:
+        # Python 3.8+: importlib.metadata is in stdlib
+        from importlib.metadata import version as _dist_version
+        return _dist_version(dist_name)
+    except Exception:
+        pass
+    try:
+        mod = __import__(import_name or dist_name, fromlist=['__version__'])
+        return getattr(mod, "__version__", None)
+    except Exception:
+        return None
 
 def hms(seconds: float) -> str:
     ms = int(round(seconds * 1000.0))
@@ -172,22 +191,39 @@ def load_audio_ffmpeg(path: str, target_sr: int = 16000) -> dict:
     Decode with FFmpeg CLI to mono float32 PCM at target_sr.
     Returns a dict compatible with pyannote's preloaded-audio path.
     """
-    # ffmpeg -i input -f f32le -ac 1 -ar 16000 pipe:1
     cmd = [
-        "ffmpeg", "-nostdin", "-threads", "0", "-i", path,
-        "-vn", "-ac", "1", "-ar", str(target_sr),
-        "-f", "f32le", "pipe:1"
+        "ffmpeg","-nostdin","-threads","0","-i",path,
+        "-vn","-ac","1","-ar",str(target_sr),
+        "-f","f32le","pipe:1"
     ]
     proc = subprocess.run(cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE, check=False)
     if proc.returncode != 0:
         raise RuntimeError(f"ffmpeg decode failed (code {proc.returncode}): {proc.stderr.decode(errors='ignore')[:500]}")
-    # Convert raw bytes → float32 mono tensor
     audio = np.frombuffer(proc.stdout, dtype=np.float32).copy()
     if audio.size == 0:
         raise RuntimeError("ffmpeg produced no audio samples.")
     wav = torch.from_numpy(audio).unsqueeze(0)  # (1, T) mono
     return {"waveform": wav, "sample_rate": target_sr}
 
+def ffmpeg_denoise(input_path: str, model_path: str, target_sr: int = 16000) -> str:
+    """
+    Denoise with RNNoise (arnndn) and resample to target_sr mono.
+    Returns path to a temporary cleaned WAV.
+    """
+    tmp = tempfile.NamedTemporaryFile(prefix="clean_", suffix=".wav", delete=False)
+    tmp.close()
+    cmd = [
+        "ffmpeg","-y","-nostdin","-threads","0","-i",input_path,
+        "-vn","-ac","1","-ar",str(target_sr),
+        "-af", f"arnndn=m={model_path}",
+        tmp.name
+    ]
+    proc = subprocess.run(cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE, check=False)
+    if proc.returncode != 0:
+        try: os.unlink(tmp.name)
+        except Exception: pass
+        raise RuntimeError(f"ffmpeg denoise failed (code {proc.returncode}): {proc.stderr.decode(errors='ignore')[:500]}")
+    return tmp.name
 
 # -----------------------
 # Data classes
@@ -202,7 +238,6 @@ class Turn:
     language: str
     lang_score: float
 
-
 # -----------------------
 # Core logic
 # -----------------------
@@ -215,23 +250,42 @@ def transcribe_audio(
     vad_filter: bool = True,
     word_timestamps: bool = True,
     condition_on_previous_text: bool = True,
+    language: Optional[str] = None,
+    patience: Optional[float] = None,
+    compression_ratio_threshold: Optional[float] = None,
+    no_speech_threshold: Optional[float] = None,
+    initial_prompt: Optional[str] = None,
     verbose: bool = False,
 ) -> List[Dict]:
-    # Auto device: CUDA if available, else CPU — independent of compute_type
+    """
+    Run faster-whisper transcription.
+
+    - beam_size: wider search improves accuracy, slower decode.
+    - word_timestamps: per-word timing (slower, more detail).
+    - condition_on_previous_text: improves cross-segment consistency.
+    - language: lock language code if known (e.g., "en", "ja"); None = auto.
+    - patience, compression_ratio_threshold, no_speech_threshold: advanced controls.
+    - initial_prompt: prime the decoder with domain-specific terms/names.
+    """
     device = "cuda" if torch.cuda.is_available() else "cpu"
     if verbose:
         logging.info(f"[Whisper] device={device} model={model_size} compute_type={compute_type} beam={beam_size} vad={vad_filter}")
     model = WhisperModel(model_size, device=device, compute_type=compute_type)
 
-    segments_gen, info = model.transcribe(
-        audio_path,
-        task="transcribe",      # keep original languages; use "translate" to force English
-        language=None,          # auto-detect; Whisper handles code-switching
+    kwargs = dict(
+        task="transcribe",
+        language=language if language else None,
         beam_size=beam_size,
         vad_filter=vad_filter,
         word_timestamps=word_timestamps,
         condition_on_previous_text=condition_on_previous_text,
+        initial_prompt=initial_prompt,
     )
+    if patience is not None: kwargs["patience"] = patience
+    if compression_ratio_threshold is not None: kwargs["compression_ratio_threshold"] = compression_ratio_threshold
+    if no_speech_threshold is not None: kwargs["no_speech_threshold"] = no_speech_threshold
+
+    segments_gen, info = model.transcribe(audio_path, **kwargs)
 
     segments = []
     for seg in segments_gen:
@@ -242,41 +296,33 @@ def transcribe_audio(
                      f"(p={getattr(info, 'language_probability', None)}) | segments={len(segments)}")
     return segments
 
-
 def diarize_speakers(
     audio_input: Union[str, dict],
     hf_token: str,
     pipeline_name: str = "pyannote/speaker-diarization-3.1",
+    num_speakers: Optional[int] = None,
     verbose: bool = False,
 ) -> Annotation:
     """
     Diarize speakers using Pyannote.
     Compatible with both the new DiarizeOutput (v3.1+) and older Annotation formats.
-    Automatically tries TorchCodec first, then torchaudio fallback.
+    Automatically tries FFmpeg CLI first, then torchaudio fallback.
     """
-    device = torch.device("cuda:0" if torch.cuda.is_available() else "cpu")
-
     if not hf_token:
         raise RuntimeError("Hugging Face token not found. Set HUGGINGFACE_TOKEN env var or pass --hf-token.")
 
     if verbose:
         logging.info(f"[Pyannote] loading pipeline: {pipeline_name}")
 
-    # Parse model_id and revision from the pipeline_name string
+    # Parse model id / revision
     model_id = pipeline_name
     revision = None
     if "@" in model_id:
         model_id, revision = model_id.split("@", 1)
         if verbose:
-            logging.info(f"[Pyannote] using model_id='{model_id}' and revision='{revision}'")
+            logging.info(f"[Pyannote] using model_id='{model_id}' revision='{revision}'")
 
-    # honor the user-provided pipeline (default: 3.1)
-    pipeline = Pipeline.from_pretrained(
-        model_id,
-        revision=revision,  # may be None
-        token=hf_token
-    )
-    
+    pipeline = Pipeline.from_pretrained(model_id, revision=revision, token=hf_token)
     device = "cuda" if torch and torch.cuda.is_available() else "cpu"
     pipeline.to(torch.device(device))
 
@@ -290,13 +336,13 @@ def diarize_speakers(
             return result.annotation
         return result
 
-    # 1) Try FFmpeg CLI path first (decode-on-the-fly to tensor)
+    # 1) Try FFmpeg CLI path first
     if try_ffmpeg_first:
         try:
             if verbose:
                 logging.info("[Pyannote] trying FFmpeg CLI decode path")
             audio_dict = load_audio_ffmpeg(audio_input)  # mono float32 16k
-            result = pipeline(audio_dict)
+            result = pipeline(audio_dict, num_speakers=num_speakers)
             return _extract_annotation(result)
         except Exception as e:
             if verbose:
@@ -310,9 +356,8 @@ def diarize_speakers(
 
     if verbose:
         logging.info("[Pyannote] using preloaded-audio (torchaudio) path")
-    result = pipeline(audio_dict)
+    result = pipeline(audio_dict, num_speakers=num_speakers)
     return _extract_annotation(result)
-
 
 def assign_speakers_to_asr(asr: List[Dict], diarization) -> List[Tuple[Dict, str]]:
     """
@@ -322,34 +367,27 @@ def assign_speakers_to_asr(asr: List[Dict], diarization) -> List[Tuple[Dict, str
       - wrapper with .annotation (Annotation)
       - wrapper with .speaker_diarization iterable of (Segment, speaker) pairs
     """
-
     # Case 1: already an Annotation
     if hasattr(diarization, "itertracks"):
         ann = diarization
-
     # Case 2: wrapper exposing .annotation -> Annotation
     elif hasattr(diarization, "annotation"):
         ann = diarization.annotation
         if not hasattr(ann, "itertracks"):
             raise TypeError("Unwrapped .annotation is not an Annotation-like object.")
-
     # Case 3: wrapper exposing .speaker_diarization -> build an Annotation
     elif hasattr(diarization, "speaker_diarization"):
         ann = Annotation()
         for turn, speaker in diarization.speaker_diarization:
-            # `turn` is a pyannote.core.Segment
             ann[turn] = str(speaker)
-
     else:
         raise TypeError(
             f"Unexpected diarization type: {type(diarization)}. "
             "Expected Annotation, or an object with .annotation or .speaker_diarization."
         )
 
-    # Now proceed uniformly with an Annotation
     turns = list(ann.itertracks(yield_label=True))  # (Segment, track, label)
     assigned: List[Tuple[Dict, str]] = []
-
     for seg in asr:
         s_start, s_end = seg["start"], seg["end"]
         best_label, best_olap = "Unknown", 0.0
@@ -359,16 +397,13 @@ def assign_speakers_to_asr(asr: List[Dict], diarization) -> List[Tuple[Dict, str
                 best_olap = ol
                 best_label = label
         assigned.append((seg, best_label))
-
     return assigned
-    
 
 def detect_language_for_text(text: str) -> Tuple[str, float]:
     if not text.strip():
         return "und", 0.0
     code, score = langid.classify(text)
     return code, float(score)
-
 
 def build_turns(asr_segments: List[Dict], diarization: Annotation, verbose: bool = False) -> List[Turn]:
     speaker_assigned = assign_speakers_to_asr(asr_segments, diarization)
@@ -390,10 +425,94 @@ def build_turns(asr_segments: List[Dict], diarization: Annotation, verbose: bool
         t.speaker = mapping.get(t.speaker, t.speaker)
     return turns
 
+# -----------------------
+# Writers + headers
+# -----------------------
 
-# -----------------------
-# Writers
-# -----------------------
+def _format_settings_header(meta: Dict[str, Union[str,int,float,bool,None]]) -> str:
+    pairs = []
+    for k, v in meta.items():
+        if isinstance(v, (list, dict)):  # keep it simple and readable
+            v = json.dumps(v, ensure_ascii=False)
+        pairs.append(f"{k}: {v}")
+    return "\n".join(pairs)
+
+def write_json(turns: List[Turn], path: Path):
+    # Preserve original schema (list of turns) for compatibility
+    data = [asdict(t) for t in turns]
+    with open(path, "w", encoding="utf-8") as f:
+        json.dump(data, f, ensure_ascii=False, indent=2)
+
+def write_meta_json(meta: Dict[str, Union[str,int,float,bool,None]], path: Path):
+    with open(path, "w", encoding="utf-8") as f:
+        json.dump(meta, f, ensure_ascii=False, indent=2)
+
+def write_srt(turns: List[Turn], path: Path, settings_header: str):
+    # SRT has no official comment; add a zero-length cue #0 with settings
+    with open(path, "w", encoding="utf-8") as f:
+        f.write("0\n00:00:00,000 --> 00:00:00,001\n")
+        f.write("[SETTINGS]\n" + settings_header + "\n\n")
+        for i, t in enumerate(turns, start=1):
+            f.write(f"{i}\n")
+            f.write(f"{hms(t.start)} --> {hms(t.end)}\n")
+            lang_tag = t.language if t.language else "und"
+            f.write(f"{t.speaker} [{lang_tag}]: {t.text}\n\n")
+
+def write_vtt(turns: List[Turn], path: Path, settings_header: str):
+    with open(path, "w", encoding="utf-8") as f:
+        f.write("WEBVTT\n\n")
+        # NOTE block is valid in VTT and ignored by players
+        f.write("NOTE\n")
+        f.write("[SETTINGS]\n" + settings_header + "\n\n")
+        for t in turns:
+            f.write(f"{vtt_ts(t.start)} --> {vtt_ts(t.end)}\n")
+            lang_tag = t.language if t.language else "und"
+            f.write(f"{t.speaker} [{lang_tag}]: {t.text}\n\n")
+
+def write_txt(turns: List[Turn], path: Path, settings_header: str):
+    with open(path, "w", encoding="utf-8") as f:
+        f.write("# Transcript\n")
+        f.write("# ---------\n")
+        for line in settings_header.splitlines():
+            f.write("# " + line + "\n")
+        f.write("\n")
+        for t in turns:
+            f.write(f"[{hms(t.start)[:-4]}] {t.speaker} ({t.language}): {t.text}\n")
+
+def write_csv(turns: List[Turn], path: Path, settings_header: str):
+    # Prepend commented header lines, then CSV body
+    with open(path, "w", encoding="utf-8") as f:
+        f.write("# SETTINGS\n")
+        for line in settings_header.splitlines():
+            f.write("# " + line + "\n")
+        f.write("# ---\n")
+        f.write("start,end,speaker,language,lang_score,text\n")
+        for t in turns:
+            row = [t.start, t.end, t.speaker, t.language, t.lang_score, t.text.replace("\n"," ").replace('"',"'")]
+            f.write(f"{row[0]},{row[1]},\"{row[2]}\",{row[3]},{row[4]},\"{row[5]}\"\n")
+
+def write_study(turns: List[Turn], path: Path, settings_header: str, include_hiragana: bool = True, include_romaji: bool = True):
+    with open(path, "w", encoding="utf-8") as f:
+        f.write("# Study Transcript (speaker order, with Japanese readings)\n")
+        for line in settings_header.splitlines():
+            f.write("# " + line + "\n")
+        f.write("\n")
+        if not _HAS_KAKASI and any((t.language == "ja" or looks_japanese(t.text)) for t in turns):
+            f.write("(Note: pykakasi not installed — hiragana/romaji hints disabled)\n\n")
+        for t in turns:
+            f.write(f"[{hms(t.start)[:-4]}] {t.speaker} ({t.language})\n")
+            f.write(t.text + "\n")
+            if (t.language == "ja" or looks_japanese(t.text)) and _HAS_KAKASI:
+                hira, roma = jp_with_readings(t.text)
+                if include_hiragana and hira.strip():
+                    f.write(f"〔hiragana〕 {hira}\n")
+                if include_romaji and roma.strip():
+                    f.write(f"〔romaji〕 {roma}\n")
+            if (t.language == "ja" or looks_japanese(t.text)) and globals().get("_HAS_ARGOS") and globals().get("_STUDY_TRANSLATE", False):
+                es = translate_ja_to_es(t.text)
+                if es:
+                    f.write(f"〔español〕 {es}\n")
+            f.write("\n")
 
 # -----------------------
 # Offline translation (Argos Translate)
@@ -403,12 +522,8 @@ try:
     _HAS_ARGOS = True
 
     def _ensure_argos_models():
-        """
-        Ensure the JA→EN and EN→ES models are installed.
-        Safe to call multiple times (no double installs).
-        """
+        """Ensure the JA→EN and EN→ES models are installed (idempotent)."""
         try:
-            # Refresh package index and check installed packages
             argostranslate.package.update_package_index()
             available = argostranslate.package.get_available_packages()
             installed = {(p.from_code, p.to_code) for p in argostranslate.package.get_installed_packages()}
@@ -444,112 +559,75 @@ except Exception:
     _HAS_ARGOS = False
     def translate_ja_to_es(_): return ""
 
-
-def write_json(turns: List[Turn], path: Path):
-    data = [asdict(t) for t in turns]
-    with open(path, "w", encoding="utf-8") as f:
-        json.dump(data, f, ensure_ascii=False, indent=2)
-
-def write_srt(turns: List[Turn], path: Path):
-    with open(path, "w", encoding="utf-8") as f:
-        for i, t in enumerate(turns, start=1):
-            f.write(f"{i}\n")
-            f.write(f"{hms(t.start)} --> {hms(t.end)}\n")
-            lang_tag = t.language if t.language else "und"
-            f.write(f"{t.speaker} [{lang_tag}]: {t.text}\n\n")
-
-def write_vtt(turns: List[Turn], path: Path):
-    with open(path, "w", encoding="utf-8") as f:
-        f.write("WEBVTT\n\n")
-        for t in turns:
-            f.write(f"{vtt_ts(t.start)} --> {vtt_ts(t.end)}\n")
-            lang_tag = t.language if t.language else "und"
-            f.write(f"{t.speaker} [{lang_tag}]: {t.text}\n\n")
-
-def write_txt(turns: List[Turn], path: Path):
-    with open(path, "w", encoding="utf-8") as f:
-        for t in turns:
-            f.write(f"[{hms(t.start)[:-4]}] {t.speaker} ({t.language}): {t.text}\n")
-
-def write_csv(turns: List[Turn], path: Path):
-    rows = [{
-        "start": t.start,
-        "end": t.end,
-        "speaker": t.speaker,
-        "language": t.language,
-        "lang_score": t.lang_score,
-        "text": t.text
-    } for t in turns]
-    pd.DataFrame(rows).to_csv(path, index=False, encoding="utf-8")
-
-def write_study(turns: List[Turn], path: Path, include_hiragana: bool = True, include_romaji: bool = True):
-    """
-    Study-friendly TXT:
-    - Keeps time, speaker, language
-    - For Japanese lines: adds kana + romaji hints if pykakasi available
-    """
-    with open(path, "w", encoding="utf-8") as f:
-        header = "# Study Transcript (speaker order, with Japanese readings)\n\n"
-        if not _HAS_KAKASI and any((t.language == "ja" or looks_japanese(t.text)) for t in turns):
-            header += "(Note: pykakasi not installed — hiragana/romaji hints disabled)\n\n"
-        f.write(header)
-        for t in turns:
-            f.write(f"[{hms(t.start)[:-4]}] {t.speaker} ({t.language})\n")
-            f.write(t.text + "\n")
-            if (t.language == "ja" or looks_japanese(t.text)) and _HAS_KAKASI:
-                hira, roma = jp_with_readings(t.text)
-                if include_hiragana and hira.strip():
-                    f.write(f"〔hiragana〕 {hira}\n")
-                if include_romaji and roma.strip():
-                    f.write(f"〔romaji〕 {roma}\n")
-            # Optional offline Spanish translation (Argos) for Japanese lines
-            if (t.language == "ja" or looks_japanese(t.text)) and globals().get("_HAS_ARGOS") and globals().get("_STUDY_TRANSLATE", False):
-                es = translate_ja_to_es(t.text)
-                if es:
-                    f.write(f"〔español〕 {es}\n")
-            f.write("\n")
-
-
 # -----------------------
 # CLI
 # -----------------------
 
 def parse_args():
     ap = argparse.ArgumentParser(
-        description="Diarize speakers + transcribe + per-segment language ID using Whisper & Pyannote. Adds study output."
+        description="Diarize speakers + transcribe + per-segment language ID using Whisper & Pyannote. "
+                    "Optionally denoise with FFmpeg/RNNoise and emit study-friendly outputs."
     )
-    ap.add_argument("input", help="Path to audio/video file (ffmpeg-compatible).")
+    ap.add_argument("input", help="Path to an audio/video file (anything FFmpeg can read: wav, mp3, mp4, mkv, mov, etc.).")
     ap.add_argument(
         "--formats",
         default="json,srt,txt",
-        help="Comma-separated outputs: json,srt,vtt,txt,csv,study (default: json,srt,txt)"
+        help="Comma-separated outputs to generate: json,srt,vtt,txt,csv,study (default: json,srt,txt)."
     )
     ap.add_argument(
         "--suffix",
         default="_whisper_diarized",
-        help="Suffix added to output filenames (before extension)."
+        help="Suffix added to output filenames (before extension), e.g., input_whisper_diarized.srt"
     )
-    ap.add_argument("--model-size", default="large-v3", help="Whisper size: tiny/base/small/medium/large-v3 (default: large-v3)")
-    ap.add_argument("--compute-type", default="float16", help="Whisper compute_type: float16,int8_float16,int8,float32")
-    ap.add_argument("--beam-size", type=int, default=5, help="Beam size for decoding.")
-    ap.add_argument("--no-vad", action="store_true", help="Disable VAD filter.")
-    ap.add_argument("--hf-token", default=os.environ.get("HUGGINGFACE_TOKEN", ""), help="Hugging Face token.")
-    ap.add_argument("--diarization-pipeline", default="pyannote/speaker-diarization-3.1",
-                    help="Pyannote pipeline repo id (default: pyannote/speaker-diarization-3.1).")
-    ap.add_argument("--preload-audio", action="store_true",
-                    help="Force preloaded-audio (torchaudio) path for diarization (bypass TorchCodec).")
-    ap.add_argument("-v", "--verbose", action="store_true", help="Verbose logging + progress bars.")
-    # decoding controls (default ON; add flags to disable)
-    ap.add_argument("--no-word-timestamps", action="store_true", help="Disable word-level timestamps (defaults to ON).")
+    # Whisper controls
+    ap.add_argument("--model-size", default="large-v3",
+                    help="Whisper model size: tiny/base/small/medium/large-v3 (default: large-v3). Larger is slower, more accurate.")
+    ap.add_argument("--compute-type", default="float16",
+                    help="Whisper compute type on GPU: float16,int8_float16,int8,float32 (default: float16). On CPU, prefer int8.")
+    ap.add_argument("--beam-size", type=int, default=5,
+                    help="Beam search width (higher = more accurate, slower). Try 1 (fast) to 8 (accurate). Default: 5.")
+    ap.add_argument("--language", default="",
+                    help="If known, lock language (e.g., 'en', 'ja', 'es'). Leave empty for auto-detect.")
+    ap.add_argument("--patience", type=float, default=None,
+                    help="Beam patience (e.g., 1.0–2.0). Allows slightly longer candidates during beam search.")
+    ap.add_argument("--compression-ratio-threshold", type=float, default=None,
+                    help="Stricter threshold reduces hallucinations (lower is stricter).")
+    ap.add_argument("--no-speech-threshold", type=float, default=None,
+                    help="Probability threshold to treat regions as silence (higher = more aggressive).")
+    ap.add_argument("--initial-prompt", default=None,
+                    help="Domain priming text (names/terms) to bias decoding at the start.")
+    ap.add_argument("--no-vad", action="store_true",
+                    help="Disable VAD filter (default is ON). Use only if words are being clipped.")
+    # Decoding detail (default ON; flags disable)
+    ap.add_argument("--no-word-timestamps", action="store_true",
+                    help="Disable per-word timestamps (defaults to ON). Speeds up but reduces timing detail.")
     ap.add_argument("--no-condition-on-previous-text", action="store_true",
-                    help="Disable conditioning on previous text (defaults to ON).")
-    # study options
+                    help="Disable conditioning on previous text (defaults to ON). Can reduce consistency.")
+    # Denoise / preprocessing
+    ap.add_argument("--ffmpeg-denoise-model", default=None,
+                    help="Optional RNNoise .rnnn model path for FFmpeg arnndn denoise. If set, a cleaned temp WAV is generated and used.")
+    # Pyannote controls
+    ap.add_argument("--hf-token", default=os.environ.get("HUGGINGFACE_TOKEN", ""),
+                    help="Hugging Face token for pyannote models (required).")
+    ap.add_argument("--diarization-pipeline", default="pyannote/speaker-diarization-3.1",
+                    help="Pyannote pipeline repo id (default: pyannote/speaker-diarization-3.1). Accepts 'repo@revision'.")
+    ap.add_argument("--num-speakers", type=int, default=None,
+                    help="If known, fix the number of speakers (improves diarization).")
+    ap.add_argument("--preload-audio", action="store_true",
+                    help="Force preloaded-audio (torchaudio) path for diarization (bypass FFmpeg).")
+    # Misc
+    ap.add_argument("-v", "--verbose", action="store_true",
+                    help="Verbose logging + progress bars.")
+    # Study options
     ap.add_argument("--study-no-hiragana", action="store_true", help="Omit hiragana line in study output.")
     ap.add_argument("--study-no-romaji", action="store_true", help="Omit romaji line in study output.")
     ap.add_argument("--study-translate", action="store_true",
                     help="Add Spanish translation for Japanese segments (offline via Argos Translate).")
     return ap.parse_args()
 
+# -----------------------
+# Main
+# -----------------------
 
 def main():
     args = parse_args()
@@ -563,31 +641,49 @@ def main():
         logging.error(f"Input not found: {in_path}")
         sys.exit(1)
 
+    # Optional denoise/preprocess
+    temp_path = None
+    working_input = str(in_path)
+    if args.ffmpeg_denoise_model:
+        try:
+            if args.verbose:
+                logging.info("[Preprocess] Denoising with FFmpeg arnndn")
+            temp_path = ffmpeg_denoise(str(in_path), args.ffmpeg_denoise_model, target_sr=16000)
+            working_input = temp_path
+        except Exception as e:
+            logging.warning(f"[Preprocess] Denoise failed: {e}. Continuing with original input.")
+
     # Transcribe (Whisper)
     asr_segments = transcribe_audio(
-        str(in_path),
+        working_input,
         model_size=args.model_size,
         compute_type=args.compute_type,
         beam_size=args.beam_size,
         vad_filter=not args.no_vad,
         word_timestamps=not args.no_word_timestamps,
         condition_on_previous_text=not args.no_condition_on_previous_text,
+        language=args.language or None,
+        patience=args.patience,
+        compression_ratio_threshold=args.compression_ratio_threshold,
+        no_speech_threshold=args.no_speech_threshold,
+        initial_prompt=args.initial_prompt,
         verbose=args.verbose
     )
 
     # Decide diarization input
     if args.preload_audio:
-        audio_input: Union[str, dict] = load_audio_ta(str(in_path))
+        audio_input: Union[str, dict] = load_audio_ta(working_input)
         if args.verbose:
-            logging.info("[Main] --preload-audio requested; bypassing TorchCodec")
+            logging.info("[Main] --preload-audio requested; bypassing FFmpeg CLI")
     else:
-        audio_input = str(in_path)
+        audio_input = working_input
 
-    # Diarize (Pyannote) with token and pipeline name; token passed as named argument as requested
+    # Diarize (Pyannote)
     diar = diarize_speakers(
         audio_input=audio_input,
         hf_token=args.hf_token,
         pipeline_name=args.diarization_pipeline,
+        num_speakers=args.num_speakers,
         verbose=args.verbose
     )
 
@@ -598,27 +694,67 @@ def main():
     # Merge + per-segment language ID
     turns = build_turns(asr_segments, diar, verbose=args.verbose)
 
+    # Prepare settings meta
+    device = "cuda" if torch.cuda.is_available() else "cpu"
+    meta = {
+        "input": str(in_path),
+        "used_input": working_input,
+        "device": device,
+        "whisper_model": args.model_size,
+        "compute_type": args.compute_type,
+        "beam_size": args.beam_size,
+        "word_timestamps": not args.no_word_timestamps,
+        "condition_on_previous_text": not args.no_condition_on_previous_text,
+        "language": args.language or None,
+        "patience": args.patience,
+        "compression_ratio_threshold": args.compression_ratio_threshold,
+        "no_speech_threshold": args.no_speech_threshold,
+        "initial_prompt": bool(args.initial_prompt),
+        "vad_filter": not args.no_vad,
+        "ffmpeg_denoise_model": args.ffmpeg_denoise_model or None,
+        "diarization_pipeline": args.diarization_pipeline,
+        "num_speakers": args.num_speakers,
+        "pyannote_device": device,
+        "study_translate": bool(args.study_translate),
+        "versions": {
+            "python": sys.version.split()[0],
+            "torch": getattr(torch, "__version__", None),
+            "torchaudio": getattr(torchaudio, "__version__", None),
+            "faster-whisper": _pkg_version("faster-whisper", "faster_whisper"),
+            "pyannote.audio": _pkg_version("pyannote.audio", "pyannote.audio"),
+            "langid": _pkg_version("langid", "langid"),
+        }
+    }
+    settings_header = _format_settings_header(meta)
+
     # Outputs — same directory as input
     base = in_path.with_suffix("")  # drop extension
     fmts = [f.strip().lower() for f in args.formats.split(",") if f.strip()]
-    out_paths = {}
+    out_paths: Dict[str, Path] = {}
 
     # Make study translation flag visible to writer without changing its signature
     globals()["_STUDY_TRANSLATE"] = bool(args.study_translate)
 
+    # Always emit a machine-readable meta file alongside other outputs
+    meta_path = Path(f"{base}{args.suffix}.meta.json")
+    write_meta_json(meta, meta_path)
+    out_paths["meta"] = meta_path
+
     if "json" in fmts:
         p = Path(f"{base}{args.suffix}.json"); write_json(turns, p); out_paths["json"] = p
     if "srt" in fmts:
-        p = Path(f"{base}{args.suffix}.srt"); write_srt(turns, p); out_paths["srt"] = p
+        p = Path(f"{base}{args.suffix}.srt"); write_srt(turns, p, settings_header); out_paths["srt"] = p
     if "vtt" in fmts:
-        p = Path(f"{base}{args.suffix}.vtt"); write_vtt(turns, p); out_paths["vtt"] = p
+        p = Path(f"{base}{args.suffix}.vtt"); write_vtt(turns, p, settings_header); out_paths["vtt"] = p
     if "txt" in fmts:
-        p = Path(f"{base}{args.suffix}.txt"); write_txt(turns, p); out_paths["txt"] = p
+        p = Path(f"{base}{args.suffix}.txt"); write_txt(turns, p, settings_header); out_paths["txt"] = p
     if "csv" in fmts:
-        p = Path(f"{base}{args.suffix}.csv"); write_csv(turns, p); out_paths["csv"] = p
+        p = Path(f"{base}{args.suffix}.csv"); write_csv(turns, p, settings_header); out_paths["csv"] = p
     if "study" in fmts:
         p = Path(f"{base}{args.suffix}.study.txt")
-        write_study(turns, p, include_hiragana=not args.study_no_hiragana, include_romaji=not args.study_no_romaji)
+        write_study(turns, p, settings_header,
+                    include_hiragana=not args.study_no_hiragana,
+                    include_romaji=not args.study_no_romaji)
         out_paths["study"] = p
 
     if args.verbose:
@@ -629,9 +765,12 @@ def main():
     for k, p in out_paths.items():
         print(f"  - {k.upper()}: {p}")
 
+    # Cleanup temp
+    if temp_path:
+        try: os.unlink(temp_path)
+        except Exception: pass
 
 if __name__ == "__main__":
     main()
 
-
-# C:\Users\epena\AppData\Roaming\Python\Python311\site-packages\~orch
+# (end)

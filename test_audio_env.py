@@ -49,8 +49,10 @@ import os
 import sys
 import math
 import argparse
-from pathlib import Path
 import warnings
+import glob
+import ctypes
+from pathlib import Path
 
 warnings.filterwarnings("ignore", message="The 'backend' parameter is not used by TorchCodec")
 
@@ -60,12 +62,16 @@ warnings.filterwarnings("ignore", message="The 'backend' parameter is not used b
 parser = argparse.ArgumentParser(description="Audio environment sanity checker")
 parser.add_argument("--hf-token", type=str, default=None, help="Hugging Face access token")
 args = parser.parse_args()
-hf_token = args.hf_token
+token = args.hf_token
 
 
 # ---------------------------------------------------------
 # UTILITIES
 # ---------------------------------------------------------
+def print_div(title):
+    print(f"\n=== {title} ===")
+
+
 def check_pkg(name):
     """Try importing a package and print its version."""
     try:
@@ -76,14 +82,6 @@ def check_pkg(name):
     except Exception as e:
         print(f"[FAIL] {name:15s} -> {type(e).__name__}: {e}")
         return None
-
-
-def print_div(title):
-    print(f"\n=== {title} ===")
-
-
-def cuda_status(torch):
-    return torch.cuda.is_available(), getattr(torch.version, "cuda", "n/a"), torch.backends.cudnn.version()
 
 
 cuda_results = {}
@@ -114,21 +112,112 @@ pykakasi = check_pkg("pykakasi")
 # ---------------------------------------------------------
 print_div("TORCH / CUDA TEST")
 if torch:
-    is_cuda, cuda_ver, cudnn_ver = cuda_status(torch)
-    print("CUDA available:", is_cuda)
-    print("CUDA version  :", cuda_ver)
-    print("cuDNN version :", cudnn_ver)
+    print("CUDA available:", torch.cuda.is_available())
+    print("CUDA version  :", getattr(torch.version, "cuda", "n/a"))
+    print("cuDNN version :", torch.backends.cudnn.version())
+    device = "cuda" if torch.cuda.is_available() else "cpu"
 
-    device = "cuda" if is_cuda else "cpu"
     try:
         x = torch.rand(2000, 2000, device=device)
         y = x @ x
-        torch.cuda.synchronize() if is_cuda else None
+        if device == "cuda":
+            torch.cuda.synchronize()
         print("✅ Tensor matmul successful on", device)
-        cuda_results["torch"] = is_cuda
+        cuda_results["torch"] = device == "cuda"
     except Exception as e:
         print("❌ Torch CUDA test failed:", e)
         cuda_results["torch"] = False
+
+
+# ---------------------------------------------------------
+# CUDNN LIBRARY TEST
+# ---------------------------------------------------------
+print_div("CUDNN LIBRARY TEST")
+
+try:
+    import torch.backends.cudnn as cudnn
+
+    cudnn_enabled = cudnn.is_available()
+    print("cuDNN available:", cudnn_enabled)
+    print("cuDNN version  :", cudnn.version())
+
+    # Attempt to locate libcudnn libraries
+    conda_prefix = os.environ.get("CONDA_PREFIX", "")
+    cudnn_libs = (
+        glob.glob("/usr/lib/x86_64-linux-gnu/libcudnn*.so*")
+        + glob.glob(f"{conda_prefix}/lib/libcudnn*.so*")
+        + glob.glob("/usr/local/cuda/lib64/libcudnn*.so*")
+    )
+
+    if cudnn_libs:
+        print(f"Found cuDNN libraries: {cudnn_libs[:2]}{'...' if len(cudnn_libs)>2 else ''}")
+        try:
+            _ = ctypes.CDLL(cudnn_libs[0])
+            print("✅ cuDNN shared library successfully loaded.")
+        except Exception as e:
+            print("⚠️ cuDNN library found but failed to load:", e)
+    else:
+        print("⚠️ cuDNN library not found in standard paths.")
+
+    # Tiny conv2d test to verify GPU execution
+    if torch.cuda.is_available():
+        device = torch.device("cuda")
+        model = torch.nn.Conv2d(3, 8, kernel_size=3, padding=1).to(device)
+        inp = torch.randn(1, 3, 64, 64, device=device)
+        with torch.backends.cudnn.flags(enabled=True):
+            out = model(inp)
+        print(f"✅ cuDNN convolution test OK (output shape {out.shape})")
+        cuda_results["cudnn"] = True
+    else:
+        print("⚠️ CUDA not available; skipping cuDNN GPU test.")
+        cuda_results["cudnn"] = False
+
+except Exception as e:
+    print("❌ cuDNN test failed:", e)
+    cuda_results["cudnn"] = False
+
+
+# ---------------------------------------------------------
+# CUDNN SYMBOL INTEGRITY TEST
+# ---------------------------------------------------------
+print_div("CUDNN SYMBOL INTEGRITY TEST")
+
+def test_cudnn_symbols():
+    possible_libs = []
+    conda_prefix = os.environ.get("CONDA_PREFIX", "")
+    search_paths = [
+        "/usr/lib/x86_64-linux-gnu/",
+        f"{conda_prefix}/lib/",
+        "/usr/local/cuda/lib64/",
+    ]
+    for path in search_paths:
+        possible_libs += glob.glob(os.path.join(path, "libcudnn_ops.so*"))
+        possible_libs += glob.glob(os.path.join(path, "libcudnn.so*"))
+
+    if not possible_libs:
+        print("⚠️ No cuDNN .so libraries found in expected locations.")
+        return False
+
+    for lib_path in possible_libs:
+        try:
+            cudnn = ctypes.CDLL(lib_path)
+            print(f"✅ Loaded: {lib_path}")
+            for sym in ["cudnnCreateTensorDescriptor", "cudnnGetVersion"]:
+                try:
+                    getattr(cudnn, sym)
+                    print(f"   ✔ Symbol {sym} found")
+                except AttributeError:
+                    print(f"   ❌ Missing symbol {sym} in {lib_path}")
+                    return False
+            print("✅ cuDNN library passed symbol integrity test.")
+            return True
+        except OSError as e:
+            print(f"❌ Failed to load {lib_path}: {e}")
+
+    print("❌ All cuDNN libraries failed to load correctly.")
+    return False
+
+cuda_results["cudnn_symbols"] = test_cudnn_symbols()
 
 
 # ---------------------------------------------------------
@@ -180,21 +269,18 @@ cuda_results["pyannote"] = False
 try:
     from pyannote.audio import Pipeline
 
-    if not hf_token:
+    if not token:
         print("⚠️ No --hf-token provided — skipping model load.")
     else:
-        pipeline = Pipeline.from_pretrained("pyannote/speaker-diarization-3.1", token=hf_token)
+        pipeline = Pipeline.from_pretrained("pyannote/speaker-diarization-3.1", use_auth_token=token)
         device = "cuda" if torch and torch.cuda.is_available() else "cpu"
         pipeline.to(torch.device(device))
         try:
-            # For older pyannote versions
             first_param = next(pipeline.parameters())
             print("✅ PyAnnote pipeline loaded on:", first_param.device)
         except Exception:
-            # For newer pyannote >= 3.3 where .parameters() doesn't exist
             print(f"✅ PyAnnote pipeline configured for device: {device}")
         cuda_results["pyannote"] = device == "cuda"
-
 except Exception as e:
     print("PyAnnote test error:", e)
 
@@ -222,9 +308,9 @@ print_div("SUMMARY")
 
 for k, used_cuda in cuda_results.items():
     status = "✅ GPU" if used_cuda else "⚠️ CPU"
-    print(f"{k:10s}: {status}")
+    print(f"{k:12s}: {status}")
 
 if all(cuda_results.values()):
-    print("\n🎉 All components successfully used CUDA!")
+    print("\n🎉 All components successfully used CUDA and cuDNN!")
 else:
-    print("\n⚠️ Some components ran on CPU. Check above for details.")
+    print("\n⚠️ Some components ran on CPU or have library issues. Check details above.")

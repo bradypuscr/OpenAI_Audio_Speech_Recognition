@@ -70,27 +70,17 @@ import langid
 import pandas as pd
 from tqdm import tqdm
 
-# --- pykakasi
+# --- pykakasi: modern API (no deprecated calls)
 try:
-    from pykakasi import kakasi
+    import pykakasi
     _HAS_KAKASI = True
-    _k_hira = kakasi()
-    _k_hira.setMode("J", "H")  # Kanji -> Hiragana
-    _k_hira.setMode("K", "H")  # Katakana -> Hiragana
-    _k_hira.setMode("H", "H")  # Hiragana -> Hiragana
-    _conv_hira = _k_hira.getConverter()
-
-    _k_romaji = kakasi()
-    _k_romaji.setMode("J", "a")  # Kanji -> Romaji
-    _k_romaji.setMode("K", "a")  # Katakana -> Romaji
-    _k_romaji.setMode("H", "a")  # Hiragana -> Romaji
-    _conv_romaji = _k_romaji.getConverter()
+    _kks = pykakasi.kakasi()  # single analyzer; modes are implicit in convert()
 
     def jp_with_readings(text: str):
-        tokens = _k_romaji.convert(text)
-        hira = " ".join(tok["hira"] for tok in _k_hira.convert(text))
-        roma = " ".join(tok["hepburn"] for tok in _k_romaji.convert(text))
-        return hira.strip(), roma.strip()
+        tokens = _kks.convert(text)  # list of dicts with keys like: orig, hira, kana, hepburn, kunrei, passport
+        hira = " ".join(t.get("hira", "") for t in tokens).strip()
+        roma = " ".join(t.get("hepburn", "") for t in tokens).strip()  # choose 'kunrei' or 'passport' if preferred
+        return hira, roma
 except Exception:
     _HAS_KAKASI = False
     def jp_with_readings(_): return "", ""

@@ -53,6 +53,8 @@ import subprocess
 import tempfile
 import textwrap
 import numpy as np
+import time
+from collections import defaultdict
 from pathlib import Path
 from dataclasses import dataclass, asdict
 from typing import List, Dict, Tuple, Union, Optional
@@ -631,6 +633,7 @@ def parse_args():
 
 def main():
     args = parse_args()
+    _t0_total = time.perf_counter()
     logging.basicConfig(
         level=logging.INFO if args.verbose else logging.WARNING,
         format="%(asctime)s - %(levelname)s - %(message)s"
@@ -669,6 +672,16 @@ def main():
         initial_prompt=args.initial_prompt,
         verbose=args.verbose
     )
+    asr_seconds = time.perf_counter() - _t0_asr
+
+    # Basic text/tempo metrics from ASR
+    total_words = sum(len(s["text"].split()) for s in asr_segments)
+    # sum of segment durations (spoken time proxy)
+    spoken_seconds = sum(max(0.0, (s["end"] - s["start"])) for s in asr_segments)
+    # full audio duration proxy from ASR (max end); robust and avoids extra probes
+    audio_seconds = max((s["end"] for s in asr_segments), default=0.0)
+    wpm_full = (total_words / (audio_seconds / 60.0)) if audio_seconds > 0 else None
+    wpm_spoken = (total_words / (spoken_seconds / 60.0)) if spoken_seconds > 0 else None
 
     # Decide diarization input
     if args.preload_audio:
@@ -678,7 +691,8 @@ def main():
     else:
         audio_input = working_input
 
-    # Diarize (Pyannote)
+    # Diarize (Pyannote) with timing
+    _t0_diar = time.perf_counter()
     diar = diarize_speakers(
         audio_input=audio_input,
         hf_token=args.hf_token,
@@ -686,6 +700,7 @@ def main():
         num_speakers=args.num_speakers,
         verbose=args.verbose
     )
+    diar_seconds = time.perf_counter() - _t0_diar
 
     # Unwrap DiarizeOutput if needed
     if hasattr(diar, "annotation"):
@@ -694,8 +709,25 @@ def main():
     # Merge + per-segment language ID
     turns = build_turns(asr_segments, diar, verbose=args.verbose)
 
+    # Per-speaker metrics (words and speaking time)
+    speaker_stats = defaultdict(lambda: {"words": 0, "speaking_seconds": 0.0})
+    for t in turns:
+        speaker_stats[t.speaker]["words"] += len(t.text.split())
+        speaker_stats[t.speaker]["speaking_seconds"] += max(0.0, t.end - t.start)
+    speaker_metrics = {
+        spk: {
+            "words": st["words"],
+            "speaking_seconds": round(st["speaking_seconds"], 3),
+            "wpm_spoken": (st["words"] / (st["speaking_seconds"] / 60.0)) if st["speaking_seconds"] > 0 else None,
+        }
+        for spk, st in speaker_stats.items()
+    }
+
     # Prepare settings meta
     device = "cuda" if torch.cuda.is_available() else "cpu"
+
+    total_seconds = time.perf_counter() - _t0_total
+
     meta = {
         "input": str(in_path),
         "used_input": working_input,
@@ -716,6 +748,17 @@ def main():
         "num_speakers": args.num_speakers,
         "pyannote_device": device,
         "study_translate": bool(args.study_translate),
+        "metrics": {
+            "transcribe_seconds": round(asr_seconds, 3),
+            "diarization_seconds": round(diar_seconds, 3),
+            "total_seconds": round(total_seconds, 3),
+            "audio_seconds_estimate": round(audio_seconds, 3),
+            "spoken_seconds_sum": round(spoken_seconds, 3),
+            "total_words": int(total_words),
+            "wpm_over_full_audio": (round(wpm_full, 2) if wpm_full is not None else None),
+            "wpm_over_spoken_time": (round(wpm_spoken, 2) if wpm_spoken is not None else None),
+            "per_speaker": speaker_metrics,
+        },
         "versions": {
             "python": sys.version.split()[0],
             "torch": getattr(torch, "__version__", None),
@@ -764,6 +807,22 @@ def main():
     print("Done. Outputs:")
     for k, p in out_paths.items():
         print(f"  - {k.upper()}: {p}")
+
+    # ---- Console timing summary
+    try:
+        print("\nSummary:")
+        print(f"  Transcription time : {asr_seconds:.2f}s")
+        print(f"  Diarization time   : {diar_seconds:.2f}s")
+        print(f"  Total runtime      : {total_seconds:.2f}s")
+        if total_words:
+            print(f"  Words              : {int(total_words)}")
+        if wpm_full is not None:
+            print(f"  WPM (full audio)   : {wpm_full:.2f}")
+        if wpm_spoken is not None:
+            print(f"  WPM (spoken time)  : {wpm_spoken:.2f}")
+    except NameError:
+        # metrics not available (older script) — skip gracefully
+        pass
 
     # Cleanup temp
     if temp_path:

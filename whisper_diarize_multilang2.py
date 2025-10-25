@@ -54,6 +54,7 @@ import tempfile
 import textwrap
 import numpy as np
 import time
+import shlex
 from collections import defaultdict
 from pathlib import Path
 from dataclasses import dataclass, asdict
@@ -65,6 +66,7 @@ warnings.filterwarnings("ignore", message="The given NumPy array is not writable
 warnings.filterwarnings("ignore", module="pyannote.audio.utils.reproducibility", category=UserWarning)
 warnings.filterwarnings("ignore", message="std\\(\\): degrees of freedom is <= 0")
 warnings.filterwarnings("ignore", category=DeprecationWarning, module="pykakasi")
+warnings.filterwarnings("ignore", message=r"Please use the new API settings to control TF32 behavior", category=UserWarning, module=r"torch\.backends\.cuda")
 
 import langid
 import pandas as pd
@@ -197,6 +199,26 @@ def load_audio_ffmpeg(path: str, target_sr: int = 16000) -> dict:
     wav = torch.from_numpy(audio).unsqueeze(0)  # (1, T) mono
     return {"waveform": wav, "sample_rate": target_sr}
 
+def probe_duration_ffprobe(path: str) -> Optional[float]:
+    """
+    Probe media duration using ffprobe. Returns seconds (float) or None.
+    """
+    try:
+        cmd = [
+            "ffprobe", "-v", "error",
+            "-show_entries", "format=duration",
+            "-of", "default=nw=1:nk=1",
+            path,
+        ]
+        proc = subprocess.run(cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE, check=False)
+        if proc.returncode != 0:
+            return None
+        out = proc.stdout.decode("utf-8", errors="ignore").strip()
+        return float(out) if out else None
+    except Exception:
+        return None
+
+
 def ffmpeg_denoise(input_path: str, model_path: str, target_sr: int = 16000) -> str:
     """
     Denoise with RNNoise (arnndn) and resample to target_sr mono.
@@ -248,6 +270,8 @@ def transcribe_audio(
     no_speech_threshold: Optional[float] = None,
     initial_prompt: Optional[str] = None,
     verbose: bool = False,
+    progress: bool = False,
+    total_duration: Optional[float] = None,
 ) -> List[Dict]:
     """
     Run faster-whisper transcription.
@@ -280,8 +304,31 @@ def transcribe_audio(
     segments_gen, info = model.transcribe(audio_path, **kwargs)
 
     segments = []
-    for seg in segments_gen:
-        segments.append({"start": seg.start, "end": seg.end, "text": seg.text.strip()})
+    # time-based progress bar using known media duration if available
+    pbar = None
+    last_prog = 0.0
+    try:
+        if progress and total_duration and total_duration > 0:
+            pbar = tqdm(total=total_duration, desc="Transcribing", unit="s", leave=True)
+        segments_gen, info = model.transcribe(audio_path, **kwargs)
+        for seg in segments_gen:
+            segments.append({"start": seg.start, "end": seg.end, "text": seg.text.strip()})
+            if pbar is not None:
+                cur = max(0.0, float(seg.end))
+                delta = max(0.0, cur - last_prog)
+                if delta:
+                    pbar.update(delta)
+                    last_prog = cur
+    finally:
+        if pbar is not None:
+            # Clamp to total if we overshot slightly and close
+            try:
+                remaining = max(0.0, pbar.total - pbar.n)
+                if remaining:
+                    pbar.update(remaining)
+            except Exception:
+                pass
+            pbar.close()
 
     if verbose:
         logging.info(f"[Whisper] primary language: {getattr(info, 'language', None)} "
@@ -397,10 +444,10 @@ def detect_language_for_text(text: str) -> Tuple[str, float]:
     code, score = langid.classify(text)
     return code, float(score)
 
-def build_turns(asr_segments: List[Dict], diarization: Annotation, verbose: bool = False) -> List[Turn]:
+def build_turns(asr_segments: List[Dict], diarization: Annotation, show_progress: bool = False) -> List[Turn]:
     speaker_assigned = assign_speakers_to_asr(asr_segments, diarization)
     turns: List[Turn] = []
-    it = tqdm(speaker_assigned, desc="Tagging language / merging", disable=not verbose)
+    it = tqdm(speaker_assigned, desc="Tagging language / merging", disable=not show_progress)
     for seg, spk in it:
         code, score = detect_language_for_text(seg["text"])
         turns.append(Turn(
@@ -610,6 +657,8 @@ def parse_args():
     # Misc
     ap.add_argument("-v", "--verbose", action="store_true",
                     help="Verbose logging + progress bars.")
+    ap.add_argument("--progress", action="store_true",
+                    help="Show progress bars even when --verbose is not set.")
     # Study options
     ap.add_argument("--study-no-hiragana", action="store_true", help="Omit hiragana line in study output.")
     ap.add_argument("--study-no-romaji", action="store_true", help="Omit romaji line in study output.")
@@ -628,6 +677,23 @@ def main():
         level=logging.INFO if args.verbose else logging.WARNING,
         format="%(asctime)s - %(levelname)s - %(message)s"
     )
+    # Extra silencing when not verbose: kill all INFO/DEBUG emitted by 3rd parties
+    if not args.verbose:
+        # Disable INFO and below globally (affects root and all child loggers)
+        logging.disable(logging.INFO)
+        # Additionally clamp a few known noisy libraries
+        for name, lvl in {
+            "argostranslate": logging.ERROR,
+            "ctranslate2": logging.WARNING,
+            "faster_whisper": logging.WARNING,
+            "pyannote.audio": logging.WARNING,
+            "transformers": logging.ERROR,
+            "urllib3": logging.ERROR,
+            "httpx": logging.ERROR,
+            "numba": logging.ERROR,
+        }.items():
+            logging.getLogger(name).setLevel(lvl)
+            logging.getLogger(name).propagate = False
 
     in_path = Path(args.input)
     if not in_path.exists():
@@ -641,13 +707,21 @@ def main():
         try:
             if args.verbose:
                 logging.info("[Preprocess] Denoising with FFmpeg arnndn")
+            pbar_dn = tqdm(total=1, desc="Denoising", disable=not (args.verbose or args.progress))
             temp_path = ffmpeg_denoise(str(in_path), args.ffmpeg_denoise_model, target_sr=16000)
             working_input = temp_path
+            pbar_dn.update(1); pbar_dn.close()
         except Exception as e:
+            try:
+                pbar_dn.close()
+            except Exception:
+                pass
             logging.warning(f"[Preprocess] Denoise failed: {e}. Continuing with original input.")
 
     # Transcribe (Whisper) with timing
     _t0_asr = time.perf_counter()
+    # Probe duration for a smoother progress bar
+    media_duration = probe_duration_ffprobe(working_input)
     asr_segments = transcribe_audio(
         working_input,
         model_size=args.model_size,
@@ -661,7 +735,9 @@ def main():
         compression_ratio_threshold=args.compression_ratio_threshold,
         no_speech_threshold=args.no_speech_threshold,
         initial_prompt=args.initial_prompt,
-        verbose=args.verbose
+        verbose=args.verbose,
+        progress=(args.verbose or args.progress),
+        total_duration=media_duration,
     )
     asr_seconds = time.perf_counter() - _t0_asr
 
@@ -684,13 +760,21 @@ def main():
 
     # Diarize (Pyannote) with timing
     _t0_diar = time.perf_counter()
-    diar = diarize_speakers(
-        audio_input=audio_input,
-        hf_token=args.hf_token,
-        pipeline_name=args.diarization_pipeline,
-        num_speakers=args.num_speakers,
-        verbose=args.verbose
-    )
+    pbar_dz = None
+    try:
+        if (args.verbose or args.progress):
+            pbar_dz = tqdm(total=1, desc="Diarizing", disable=False)
+        diar = diarize_speakers(
+            audio_input=audio_input,
+            hf_token=args.hf_token,
+            pipeline_name=args.diarization_pipeline,
+            num_speakers=args.num_speakers,
+            verbose=args.verbose
+        )
+    finally:
+        if pbar_dz is not None:
+            pbar_dz.update(1)
+            pbar_dz.close()
     diar_seconds = time.perf_counter() - _t0_diar
 
     # Unwrap DiarizeOutput if needed
@@ -698,7 +782,7 @@ def main():
         diar = diar.annotation
 
     # Merge + per-segment language ID
-    turns = build_turns(asr_segments, diar, verbose=args.verbose)
+    turns = build_turns(asr_segments, diar, show_progress=(args.verbose or args.progress))
 
     # Per-speaker metrics (words and speaking time)
     speaker_stats = defaultdict(lambda: {"words": 0, "speaking_seconds": 0.0})

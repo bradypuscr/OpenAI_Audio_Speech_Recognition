@@ -56,6 +56,8 @@ import numpy as np
 import time
 import shlex
 import re
+import shutil
+import csv
 from collections import defaultdict
 from pathlib import Path
 from dataclasses import dataclass, asdict
@@ -91,15 +93,7 @@ except Exception:
 # --- Whisper, Pyannote
 from faster_whisper import WhisperModel
 from pyannote.audio import Pipeline
-from pyannote.core import Annotation
-
-# We’ll try to use torchcodec; if not present or fails at runtime, we fallback to preloaded audio
-def _has_torchcodec() -> bool:
-    try:
-        import torchcodec  # noqa: F401
-        return True
-    except Exception:
-        return False
+from pyannote.core import Annotation, Segment
 
 # --- torch/torchaudio for preload fallback + device detection
 import torch
@@ -302,8 +296,6 @@ def transcribe_audio(
     if compression_ratio_threshold is not None: kwargs["compression_ratio_threshold"] = compression_ratio_threshold
     if no_speech_threshold is not None: kwargs["no_speech_threshold"] = no_speech_threshold
 
-    segments_gen, info = model.transcribe(audio_path, **kwargs)
-
     segments = []
     # time-based progress bar using known media duration if available
     pbar = None
@@ -311,6 +303,7 @@ def transcribe_audio(
     try:
         if progress and total_duration and total_duration > 0:
             pbar = tqdm(total=total_duration, desc="Transcribing", unit="s", leave=True)
+        # Single transcription call driving progress
         segments_gen, info = model.transcribe(audio_path, **kwargs)
         for seg in segments_gen:
             segments.append({"start": seg.start, "end": seg.end, "text": seg.text.strip()})
@@ -348,8 +341,9 @@ def diarize_speakers(
     Compatible with both the new DiarizeOutput (v3.1+) and older Annotation formats.
     Automatically tries FFmpeg CLI first, then torchaudio fallback.
     """
+    # NOTE: main() guards calls to this when token is missing or diarization is skipped.
     if not hf_token:
-        raise RuntimeError("Hugging Face token not found. Set HUGGINGFACE_TOKEN env var or pass --hf-token.")
+        raise RuntimeError("Hugging Face token not found. This function expects a token.")
 
     if verbose:
         logging.info(f"[Pyannote] loading pipeline: {pipeline_name}")
@@ -633,16 +627,23 @@ def write_txt(turns: List[Turn], path: Path, settings_header: str):
             f.write(f"[{hms(t.start)[:-4]}] {t.speaker} ({t.language}): {t.text}\n")
 
 def write_csv(turns: List[Turn], path: Path, settings_header: str):
-    # Prepend commented header lines, then CSV body
-    with open(path, "w", encoding="utf-8") as f:
+    # Prepend commented header lines, then write CSV with robust quoting
+    with open(path, "w", encoding="utf-8", newline="") as f:
         f.write("# SETTINGS\n")
         for line in settings_header.splitlines():
             f.write("# " + line + "\n")
         f.write("# ---\n")
-        f.write("start,end,speaker,language,lang_score,text\n")
+        writer = csv.writer(f, quoting=csv.QUOTE_ALL)
+        writer.writerow(["start", "end", "speaker", "language", "lang_score", "text"])
         for t in turns:
-            row = [t.start, t.end, t.speaker, t.language, t.lang_score, t.text.replace("\n"," ").replace('"',"'")]
-            f.write(f"{row[0]},{row[1]},\"{row[2]}\",{row[3]},{row[4]},\"{row[5]}\"\n")
+            writer.writerow([
+                t.start,
+                t.end,
+                t.speaker,
+                t.language,
+                t.lang_score,
+                t.text.replace("\n", " ")
+            ])
 
 def write_study(turns: List[Turn], path: Path, settings_header: str, include_hiragana: bool = True, include_romaji: bool = True):
     with open(path, "w", encoding="utf-8") as f:
@@ -768,6 +769,8 @@ def parse_args():
                     help="If known, fix the number of speakers (improves diarization).")
     ap.add_argument("--preload-audio", action="store_true",
                     help="Force preloaded-audio (torchaudio) path for diarization (bypass FFmpeg).")
+    ap.add_argument("--skip-diarization", action="store_true",
+                    help="Skip speaker diarization (treat as a single speaker). Useful when no HF token is available.")
     # Misc
     ap.add_argument("-v", "--verbose", action="store_true",
                     help="Verbose logging + progress bars.")
@@ -816,6 +819,19 @@ def main():
     if not in_path.exists():
         logging.error(f"Input not found: {in_path}")
         sys.exit(1)
+
+    # ---- Early FFmpeg/FFprobe guards (fail fast with clear hints)
+    for tool in ("ffmpeg", "ffprobe"):
+        if shutil.which(tool) is None:
+            print(
+                f"ERROR: Required tool '{tool}' was not found on your PATH.\n"
+                "Install hints:\n"
+                "  - macOS:   brew install ffmpeg\n"
+                "  - Ubuntu:  sudo apt-get update && sudo apt-get install -y ffmpeg\n"
+                "  - Windows: winget install Gyan.FFmpeg (then restart shell)\n",
+                file=sys.stderr
+            )
+            sys.exit(1)
 
     # Optional denoise/preprocess
     temp_path = None
@@ -875,24 +891,34 @@ def main():
     else:
         audio_input = working_input
 
-    # Diarize (Pyannote) with timing
+    # Diarize (Pyannote) with timing — allow graceful skip when no token or --skip-diarization
     _t0_diar = time.perf_counter()
-    pbar_dz = None
-    try:
-        if (args.verbose or args.progress):
-            pbar_dz = tqdm(total=1, desc="Diarizing", disable=False)
-        diar = diarize_speakers(
-            audio_input=audio_input,
-            hf_token=args.hf_token,
-            pipeline_name=args.diarization_pipeline,
-            num_speakers=args.num_speakers,
-            verbose=args.verbose
-        )
-    finally:
-        if pbar_dz is not None:
-            pbar_dz.update(1)
-            pbar_dz.close()
-    diar_seconds = time.perf_counter() - _t0_diar
+    diar_seconds = 0.0
+    diar = None
+    do_diarization = (not args.skip_diarization) and bool(args.hf_token)
+    if do_diarization:
+        pbar_dz = None
+        try:
+            if (args.verbose or args.progress):
+                pbar_dz = tqdm(total=1, desc="Diarizing", disable=False)
+            diar = diarize_speakers(
+                audio_input=audio_input,
+                hf_token=args.hf_token,
+                pipeline_name=args.diarization_pipeline,
+                num_speakers=args.num_speakers,
+                verbose=args.verbose
+            )
+        finally:
+            if pbar_dz is not None:
+                pbar_dz.update(1)
+                pbar_dz.close()
+        diar_seconds = time.perf_counter() - _t0_diar
+    else:
+        if not args.hf_token and not args.skip_diarization:
+            logging.warning("[Main] --hf-token not provided; skipping diarization (single-speaker fallback).")
+        # Build a simple single-speaker annotation covering the whole audio
+        diar = Annotation()
+        diar[Segment(0.0, max((s['end'] for s in asr_segments), default=0.0))] = "Speaker 1"
 
     # Unwrap DiarizeOutput if needed
     if hasattr(diar, "annotation"):
@@ -938,6 +964,7 @@ def main():
         "ffmpeg_denoise_model": args.ffmpeg_denoise_model or None,
         "diarization_pipeline": args.diarization_pipeline,
         "num_speakers": args.num_speakers,
+        "skip_diarization": not do_diarization,
         "pyannote_device": device,
         "study_translate": not args.no_study_translate,
         "metrics": {

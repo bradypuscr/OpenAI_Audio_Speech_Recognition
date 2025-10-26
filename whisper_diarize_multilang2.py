@@ -55,6 +55,7 @@ import textwrap
 import numpy as np
 import time
 import shlex
+import re
 from collections import defaultdict
 from pathlib import Path
 from dataclasses import dataclass, asdict
@@ -486,6 +487,119 @@ def write_meta_json(meta: Dict[str, Union[str,int,float,bool,None]], path: Path)
     with open(path, "w", encoding="utf-8") as f:
         json.dump(meta, f, ensure_ascii=False, indent=2)
 
+def _format_ts_for_example(seconds: float) -> str:
+    # hh:mm:ss (no milliseconds) for compact examples
+    ms = int(round(seconds * 1000.0))
+    hrs = ms // 3_600_000
+    ms %= 3_600_000
+    mins = ms // 60_000
+    ms %= 60_000
+    secs = ms // 1000
+    return f"{hrs:02d}:{mins:02d}:{secs:02d}"
+
+def _looks_japanese_text(s: str) -> bool:
+    # mirrors looks_japanese but works on small tokens too
+    for ch in s:
+        code = ord(ch)
+        if (0x3040 <= code <= 0x309F) or (0x30A0 <= code <= 0x30FF) or (0x4E00 <= code <= 0x9FFF):
+            return True
+    return False
+
+def build_glossary(turns: List[Turn]) -> List[Dict[str, str]]:
+    """
+    Collect unique Japanese terms from JA segments (or lines that look Japanese),
+    using pykakasi tokenization to get readings. Count frequencies and keep first example time.
+    """
+    entries: Dict[str, Dict[str, Union[str, int, float]]] = {}
+    for t in turns:
+        if not (t.language == "ja" or _looks_japanese_text(t.text)):
+            continue
+        text = t.text.strip()
+        if not text:
+            continue
+        # Tokenize via pykakasi if available; else very rough fallback by Kanji/Hiragana/Katakana runs
+        tokens = []
+        if _HAS_KAKASI:
+            for token in _kks.convert(text):
+                orig = (token.get("orig") or "").strip()
+                if not orig or not _looks_japanese_text(orig):
+                    continue
+                hira = (token.get("hira") or "").strip()
+                roma = (token.get("hepburn") or "").strip()
+                tokens.append((orig, hira, roma))
+        else:
+            # Fallback: split by non-CJK and keep CJK runs as "terms"
+            for m in re.finditer(r"[\u3040-\u30FF\u4E00-\u9FFF]+", text):
+                term = m.group(0)
+                tokens.append((term, "", ""))
+
+        for orig, hira, roma in tokens:
+            if not orig:
+                continue
+            if orig not in entries:
+                entries[orig] = {
+                    "term": orig,
+                    "hira": hira,
+                    "roma": roma,
+                    "count": 0,
+                    "first_ts": _format_ts_for_example(t.start),
+                    "example": text,
+                }
+            entries[orig]["count"] += 1  # type: ignore
+
+    # Optional Spanish translation (only if Argos present and study_translate was requested)
+    if globals().get("_HAS_ARGOS") and globals().get("_STUDY_TRANSLATE", False):
+        for k, e in entries.items():
+            term = e["term"]  # type: ignore
+            try:
+                es = translate_ja_to_es(term) or ""
+            except Exception:
+                es = ""
+            e["es"] = es  # type: ignore
+
+    # Sort by frequency desc, then term
+    sorted_entries = sorted(entries.values(), key=lambda d: (-int(d["count"]), str(d["term"])))  # type: ignore
+    return [  # cast to list of str->str for writing
+        {
+            "term": str(e.get("term", "")),
+            "hira": str(e.get("hira", "")),
+            "roma": str(e.get("roma", "")),
+            "count": str(e.get("count", "")),
+            "first_ts": str(e.get("first_ts", "")),
+            "example": str(e.get("example", "")),
+            "es": str(e.get("es", "")) if "es" in e else "",
+        } for e in sorted_entries
+    ]
+
+def write_glossary(gloss: List[Dict[str, str]], path: Path, settings_header: str):
+    """
+    Write a human-friendly glossary. One entry per block:
+      term | hira | roma | count | first_ts
+      es? (if present)
+      example: ...
+    """
+    with open(path, "w", encoding="utf-8") as f:
+        f.write("# Glossary (auto-collected from Japanese segments)\n")
+        for line in settings_header.splitlines():
+            f.write("# " + line + "\n")
+        f.write("\n")
+        if not gloss:
+            f.write("(No Japanese terms detected.)\n")
+            return
+        for e in gloss:
+            header = f"{e['term']}"
+            extras = []
+            if e.get("hira"): extras.append(f"hira: {e['hira']}")
+            if e.get("roma"): extras.append(f"romaji: {e['roma']}")
+            if e.get("count"): extras.append(f"count: {e['count']}")
+            if e.get("first_ts"): extras.append(f"first: {e['first_ts']}")
+            f.write(header + ("  |  " + "  |  ".join(extras) if extras else "") + "\n")
+            if e.get("es"):
+                f.write(f"  es: {e['es']}\n")
+            if e.get("example"):
+                f.write(f"  example: {e['example']}\n")
+            f.write("\n")
+
 def write_srt(turns: List[Turn], path: Path, settings_header: str):
     # SRT has no official comment; add a zero-length cue #0 with settings
     with open(path, "w", encoding="utf-8") as f:
@@ -662,8 +776,11 @@ def parse_args():
     # Study options
     ap.add_argument("--study-no-hiragana", action="store_true", help="Omit hiragana line in study output.")
     ap.add_argument("--study-no-romaji", action="store_true", help="Omit romaji line in study output.")
-    ap.add_argument("--study-translate", action="store_true",
-                    help="Add Spanish translation for Japanese segments (offline via Argos Translate).")
+    ap.add_argument("--no-study-translate", action="store_true",
+                    help="Disable Spanish translation for Japanese segments in the study output.")
+    # Glossary
+    ap.add_argument("--glossary", action="store_true",
+                    help="Emit a Japanese term glossary alongside other outputs (suffix: .glossary.txt).")
     return ap.parse_args()
 
 # -----------------------
@@ -822,7 +939,7 @@ def main():
         "diarization_pipeline": args.diarization_pipeline,
         "num_speakers": args.num_speakers,
         "pyannote_device": device,
-        "study_translate": bool(args.study_translate),
+        "study_translate": not args.no_study_translate,
         "metrics": {
             "transcribe_seconds": round(asr_seconds, 3),
             "diarization_seconds": round(diar_seconds, 3),
@@ -851,15 +968,16 @@ def main():
     out_paths: Dict[str, Path] = {}
 
     # Make study translation flag visible to writer without changing its signature
-    globals()["_STUDY_TRANSLATE"] = bool(args.study_translate)
+    globals()["_STUDY_TRANSLATE"] = not args.no_study_translate
 
-    # Always emit a machine-readable meta file alongside other outputs
-    meta_path = Path(f"{base}{args.suffix}.meta.json")
-    write_meta_json(meta, meta_path)
-    out_paths["meta"] = meta_path
-
+    # Emit machine-readable meta **only** when JSON is requested
     if "json" in fmts:
-        p = Path(f"{base}{args.suffix}.json"); write_json(turns, p); out_paths["json"] = p
+        meta_path = Path(f"{base}{args.suffix}.meta.json")
+        write_meta_json(meta, meta_path)
+        out_paths["meta"] = meta_path
+        p = Path(f"{base}{args.suffix}.json")
+        write_json(turns, p)
+        out_paths["json"] = p
     if "srt" in fmts:
         p = Path(f"{base}{args.suffix}.srt"); write_srt(turns, p, settings_header); out_paths["srt"] = p
     if "vtt" in fmts:
@@ -874,6 +992,11 @@ def main():
                     include_hiragana=not args.study_no_hiragana,
                     include_romaji=not args.study_no_romaji)
         out_paths["study"] = p
+    if args.glossary:
+        g = build_glossary(turns)
+        p = Path(f"{base}{args.suffix}.glossary.txt")
+        write_glossary(g, p, settings_header)
+        out_paths["glossary"] = p
 
     if args.verbose:
         for k, p in out_paths.items():

@@ -56,6 +56,8 @@ import numpy as np
 import time
 import shlex
 import re
+import io
+import unicodedata
 import shutil
 import csv
 from collections import defaultdict
@@ -98,6 +100,27 @@ from pyannote.core import Annotation, Segment
 # --- torch/torchaudio for preload fallback + device detection
 import torch
 import torchaudio
+
+# -----------------------
+# Normalization / cleanup & atomic write helpers
+# -----------------------
+
+def _normalize_text_nfc(s: str) -> str:
+    """Normalize to NFC and collapse repeated whitespace, trim edges."""
+    if not isinstance(s, str):
+        return s
+    s = unicodedata.normalize("NFC", s)
+    s = re.sub(r"\s+", " ", s).strip()
+    return s
+
+def _atomic_write_text(path: Path, content: str, encoding: str = "utf-8"):
+    """Write text atomically to avoid partial files on crashes."""
+    tmp_path = path.with_suffix(path.suffix + ".tmp")
+    with open(tmp_path, "w", encoding=encoding, newline="") as f:
+        f.write(content)
+        f.flush()
+        os.fsync(f.fileno())
+    os.replace(tmp_path, path)
 
 # -----------------------
 # Utilities
@@ -444,12 +467,14 @@ def build_turns(asr_segments: List[Dict], diarization: Annotation, show_progress
     turns: List[Turn] = []
     it = tqdm(speaker_assigned, desc="Tagging language / merging", disable=not show_progress)
     for seg, spk in it:
-        code, score = detect_language_for_text(seg["text"])
+        # Clean punctuation/spacing and normalize to NFC before downstream use
+        cleaned_text = _normalize_text_nfc(seg["text"])
+        code, score = detect_language_for_text(cleaned_text)
         turns.append(Turn(
             start=float(seg["start"]),
             end=float(seg["end"]),
             speaker=spk,
-            text=seg["text"],
+            text=cleaned_text,
             language=code,
             lang_score=score,
         ))
@@ -458,6 +483,19 @@ def build_turns(asr_segments: List[Dict], diarization: Annotation, show_progress
     for t in turns:
         t.speaker = mapping.get(t.speaker, t.speaker)
     return turns
+
+def merge_adjacent(turns: List[Turn], max_gap: float = 0.3) -> List[Turn]:
+    """Merge consecutive turns by same speaker when gap <= max_gap seconds."""
+    if not turns:
+        return turns
+    merged: List[Turn] = []
+    for t in sorted(turns, key=lambda x: x.start):
+        if merged and merged[-1].speaker == t.speaker and (t.start - merged[-1].end) <= max_gap:
+            merged[-1].end = max(merged[-1].end, t.end)
+            merged[-1].text = _normalize_text_nfc((merged[-1].text + " " + t.text).strip())
+        else:
+            merged.append(t)
+    return merged
 
 # -----------------------
 # Writers + headers
@@ -474,12 +512,12 @@ def _format_settings_header(meta: Dict[str, Union[str,int,float,bool,None]]) -> 
 def write_json(turns: List[Turn], path: Path):
     # Preserve original schema (list of turns) for compatibility
     data = [asdict(t) for t in turns]
-    with open(path, "w", encoding="utf-8") as f:
-        json.dump(data, f, ensure_ascii=False, indent=2)
+    content = json.dumps(data, ensure_ascii=False, indent=2)
+    _atomic_write_text(path, content)
 
 def write_meta_json(meta: Dict[str, Union[str,int,float,bool,None]], path: Path):
-    with open(path, "w", encoding="utf-8") as f:
-        json.dump(meta, f, ensure_ascii=False, indent=2)
+    content = json.dumps(meta, ensure_ascii=False, indent=2)
+    _atomic_write_text(path, content)
 
 def _format_ts_for_example(seconds: float) -> str:
     # hh:mm:ss (no milliseconds) for compact examples
@@ -572,101 +610,119 @@ def write_glossary(gloss: List[Dict[str, str]], path: Path, settings_header: str
       es? (if present)
       example: ...
     """
-    with open(path, "w", encoding="utf-8") as f:
-        f.write("# Glossary (auto-collected from Japanese segments)\n")
-        for line in settings_header.splitlines():
-            f.write("# " + line + "\n")
-        f.write("\n")
-        if not gloss:
-            f.write("(No Japanese terms detected.)\n")
-            return
-        for e in gloss:
-            header = f"{e['term']}"
-            extras = []
-            if e.get("hira"): extras.append(f"hira: {e['hira']}")
-            if e.get("roma"): extras.append(f"romaji: {e['roma']}")
-            if e.get("count"): extras.append(f"count: {e['count']}")
-            if e.get("first_ts"): extras.append(f"first: {e['first_ts']}")
-            f.write(header + ("  |  " + "  |  ".join(extras) if extras else "") + "\n")
-            if e.get("es"):
-                f.write(f"  es: {e['es']}\n")
-            if e.get("example"):
-                f.write(f"  example: {e['example']}\n")
-            f.write("\n")
+    buf = io.StringIO()
+    buf.write("# Glossary (auto-collected from Japanese segments)\n")
+    for line in settings_header.splitlines():
+        buf.write("# " + line + "\n")
+    buf.write("\n")
+    if not gloss:
+        buf.write("(No Japanese terms detected.)\n")
+        _atomic_write_text(path, buf.getvalue())
+        return
+    for e in gloss:
+        # Normalize key fields
+        e = {k: _normalize_text_nfc(v or "") for k, v in e.items()}
+        header = f"{e['term']}"
+        extras = []
+        if e.get("hira"): extras.append(f"hira: {e['hira']}")
+        if e.get("roma"): extras.append(f"romaji: {e['roma']}")
+        if e.get("count"): extras.append(f"count: {e['count']}")
+        if e.get("first_ts"): extras.append(f"first: {e['first_ts']}")
+        buf.write(header + ("  |  " + "  |  ".join(extras) if extras else "") + "\n")
+        if e.get("es"):
+            buf.write(f"  es: {e['es']}\n")
+        if e.get("example"):
+            buf.write(f"  example: {e['example']}\n")
+        buf.write("\n")
+    _atomic_write_text(path, buf.getvalue())
 
 def write_srt(turns: List[Turn], path: Path, settings_header: str):
     # SRT has no official comment; add a zero-length cue #0 with settings
-    with open(path, "w", encoding="utf-8") as f:
-        f.write("0\n00:00:00,000 --> 00:00:00,001\n")
-        f.write("[SETTINGS]\n" + settings_header + "\n\n")
-        for i, t in enumerate(turns, start=1):
-            f.write(f"{i}\n")
-            f.write(f"{hms(t.start)} --> {hms(t.end)}\n")
-            lang_tag = t.language if t.language else "und"
-            f.write(f"{t.speaker} [{lang_tag}]: {t.text}\n\n")
+    buf = io.StringIO()
+    buf.write("0\n00:00:00,000 --> 00:00:00,001\n")
+    buf.write("[SETTINGS]\n" + settings_header + "\n\n")
+    for i, t in enumerate(turns, start=1):
+        spk = _normalize_text_nfc(t.speaker)
+        txt = _normalize_text_nfc(t.text)
+        lang_tag = t.language if t.language else "und"
+        buf.write(f"{i}\n")
+        buf.write(f"{hms(t.start)} --> {hms(t.end)}\n")
+        buf.write(f"{spk} [{lang_tag}]: {txt}\n\n")
+    _atomic_write_text(path, buf.getvalue())
 
 def write_vtt(turns: List[Turn], path: Path, settings_header: str):
-    with open(path, "w", encoding="utf-8") as f:
-        f.write("WEBVTT\n\n")
-        # NOTE block is valid in VTT and ignored by players
-        f.write("NOTE\n")
-        f.write("[SETTINGS]\n" + settings_header + "\n\n")
-        for t in turns:
-            f.write(f"{vtt_ts(t.start)} --> {vtt_ts(t.end)}\n")
-            lang_tag = t.language if t.language else "und"
-            f.write(f"{t.speaker} [{lang_tag}]: {t.text}\n\n")
+    buf = io.StringIO()
+    buf.write("WEBVTT\n\n")
+    buf.write("NOTE\n")
+    buf.write("[SETTINGS]\n" + settings_header + "\n\n")
+    for t in turns:
+        spk = _normalize_text_nfc(t.speaker)
+        txt = _normalize_text_nfc(t.text)
+        lang_tag = t.language if t.language else "und"
+        buf.write(f"{vtt_ts(t.start)} --> {vtt_ts(t.end)}\n")
+        buf.write(f"{spk} [{lang_tag}]: {txt}\n\n")
+    _atomic_write_text(path, buf.getvalue())
 
 def write_txt(turns: List[Turn], path: Path, settings_header: str):
-    with open(path, "w", encoding="utf-8") as f:
-        f.write("# Transcript\n")
-        f.write("# ---------\n")
-        for line in settings_header.splitlines():
-            f.write("# " + line + "\n")
-        f.write("\n")
-        for t in turns:
-            f.write(f"[{hms(t.start)[:-4]}] {t.speaker} ({t.language}): {t.text}\n")
+    buf = io.StringIO()
+    buf.write("# Transcript\n")
+    buf.write("# ---------\n")
+    for line in settings_header.splitlines():
+        buf.write("# " + line + "\n")
+    buf.write("\n")
+    for t in turns:
+        spk = _normalize_text_nfc(t.speaker)
+        txt = _normalize_text_nfc(t.text)
+        buf.write(f"[{hms(t.start)[:-4]}] {spk} ({t.language}): {txt}\n")
+    _atomic_write_text(path, buf.getvalue())
 
 def write_csv(turns: List[Turn], path: Path, settings_header: str):
     # Prepend commented header lines, then write CSV with robust quoting
-    with open(path, "w", encoding="utf-8", newline="") as f:
-        f.write("# SETTINGS\n")
-        for line in settings_header.splitlines():
-            f.write("# " + line + "\n")
-        f.write("# ---\n")
-        writer = csv.writer(f, quoting=csv.QUOTE_ALL)
-        writer.writerow(["start", "end", "speaker", "language", "lang_score", "text"])
-        for t in turns:
-            writer.writerow([
-                t.start,
-                t.end,
-                t.speaker,
-                t.language,
-                t.lang_score,
-                t.text.replace("\n", " ")
-            ])
+    # Build entire content in-memory to ensure atomic replace after success
+    header = io.StringIO()
+    header.write("# SETTINGS\n")
+    for line in settings_header.splitlines():
+        header.write("# " + line + "\n")
+    header.write("# ---\n")
+    csv_buf = io.StringIO(newline="")
+    writer = csv.writer(csv_buf, quoting=csv.QUOTE_ALL)
+    writer.writerow(["start", "end", "speaker", "language", "lang_score", "text"])
+    for t in turns:
+        writer.writerow([
+            t.start,
+            t.end,
+            _normalize_text_nfc(t.speaker),
+            t.language,
+            t.lang_score,
+            _normalize_text_nfc(t.text).replace("\n", " ")
+        ])
+    _atomic_write_text(path, header.getvalue() + csv_buf.getvalue())
 
 def write_study(turns: List[Turn], path: Path, settings_header: str, include_hiragana: bool = True, include_romaji: bool = True):
-    with open(path, "w", encoding="utf-8") as f:
-        f.write("# Study Transcript (speaker order, with Japanese readings)\n")
-        for line in settings_header.splitlines():
-            f.write("# " + line + "\n")
-        f.write("\n")
-        if not _HAS_KAKASI and any((t.language == "ja" or looks_japanese(t.text)) for t in turns):
-            f.write("(Note: pykakasi not installed — hiragana/romaji hints disabled)\n\n")
-        for t in turns:
-            f.write(f"[{hms(t.start)[:-4]}] {t.speaker} ({t.language})\n")
-            f.write(t.text + "\n")
-            if (t.language == "ja" or looks_japanese(t.text)) and _HAS_KAKASI:
-                hira, roma = jp_with_readings(t.text)
-                if include_hiragana and hira.strip():
-                    f.write(f"〔hiragana〕 {hira}\n")
-                if include_romaji and roma.strip():
-                    f.write(f"〔romaji〕 {roma}\n")
-            if (t.language == "ja" or looks_japanese(t.text)) and globals().get("_HAS_ARGOS") and globals().get("_STUDY_TRANSLATE", False):
-                es = translate_ja_to_es(t.text)
-                if es:
-                    f.write(f"〔español〕 {es}\n")
-            f.write("\n")
+    buf = io.StringIO()
+    buf.write("# Study Transcript (speaker order, with Japanese readings)\n")
+    for line in settings_header.splitlines():
+        buf.write("# " + line + "\n")
+    buf.write("\n")
+    if not _HAS_KAKASI and any((t.language == "ja" or looks_japanese(t.text)) for t in turns):
+        buf.write("(Note: pykakasi not installed — hiragana/romaji hints disabled)\n\n")
+    for t in turns:
+        spk = _normalize_text_nfc(t.speaker)
+        txt = _normalize_text_nfc(t.text)
+        buf.write(f"[{hms(t.start)[:-4]}] {spk} ({t.language})\n")
+        buf.write(txt + "\n")
+        if (t.language == "ja" or looks_japanese(t.text)) and _HAS_KAKASI:
+            hira, roma = jp_with_readings(txt)
+            if include_hiragana and hira.strip():
+                buf.write(f"〔hiragana〕 {hira}\n")
+            if include_romaji and roma.strip():
+                buf.write(f"〔romaji〕 {roma}\n")
+        if (t.language == "ja" or looks_japanese(t.text)) and globals().get("_HAS_ARGOS") and globals().get("_STUDY_TRANSLATE", False):
+            es = translate_ja_to_es(txt)
+            if es:
+                buf.write(f"〔español〕 {es}\n")
+        buf.write("\n")
+    _atomic_write_text(path, buf.getvalue())
 
 # -----------------------
 # Offline translation (Argos Translate)
@@ -722,17 +778,12 @@ def parse_args():
         description="Diarize speakers + transcribe + per-segment language ID using Whisper & Pyannote. "
                     "Optionally denoise with FFmpeg/RNNoise and emit study-friendly outputs."
     )
-    ap.add_argument("input", help="Path to an audio/video file (anything FFmpeg can read: wav, mp3, mp4, mkv, mov, etc.).")
-    ap.add_argument(
-        "--formats",
-        default="json,srt,txt",
-        help="Comma-separated outputs to generate: json,srt,vtt,txt,csv,study (default: json,srt,txt)."
-    )
-    ap.add_argument(
-        "--suffix",
-        default="_whisper_diarized",
-        help="Suffix added to output filenames (before extension), e.g., input_whisper_diarized.srt"
-    )
+    ap.add_argument("input", 
+                    help="Path to an audio/video file (anything FFmpeg can read: wav, mp3, mp4, mkv, mov, etc.).")
+    ap.add_argument("--formats", default="json,srt,txt", 
+                    help="Comma-separated outputs to generate: json,srt,vtt,txt,csv,study (default: json,srt,txt).")
+    ap.add_argument("--suffix", default="_whisper_diarized", 
+                    help="Suffix added to output filenames (before extension), e.g., input_whisper_diarized.srt")
     # Whisper controls
     ap.add_argument("--model-size", default="large-v3",
                     help="Whisper model size: tiny/base/small/medium/large-v3 (default: large-v3). Larger is slower, more accurate.")
@@ -765,6 +816,10 @@ def parse_args():
                     help="Hugging Face token for pyannote models (required).")
     ap.add_argument("--diarization-pipeline", default="pyannote/speaker-diarization-3.1",
                     help="Pyannote pipeline repo id (default: pyannote/speaker-diarization-3.1). Accepts 'repo@revision'.")
+    ap.add_argument("--diarization-revision", default=None,
+                    help="Optional explicit revision for the diarization pipeline (overrides any '@rev' in --diarization-pipeline).")
+    ap.add_argument("--hf-cache-dir", default=None,
+                    help="Optional Hugging Face cache directory to reduce repeated downloads (sets HF_HOME for this run).")
     ap.add_argument("--num-speakers", type=int, default=None,
                     help="If known, fix the number of speakers (improves diarization).")
     ap.add_argument("--preload-audio", action="store_true",
@@ -777,13 +832,17 @@ def parse_args():
     ap.add_argument("--progress", action="store_true",
                     help="Show progress bars even when --verbose is not set.")
     # Study options
-    ap.add_argument("--study-no-hiragana", action="store_true", help="Omit hiragana line in study output.")
-    ap.add_argument("--study-no-romaji", action="store_true", help="Omit romaji line in study output.")
+    ap.add_argument("--study-no-hiragana", action="store_true", 
+                    help="Omit hiragana line in study output.")
+    ap.add_argument("--study-no-romaji", action="store_true", 
+                    help="Omit romaji line in study output.")
     ap.add_argument("--no-study-translate", action="store_true",
                     help="Disable Spanish translation for Japanese segments in the study output.")
     # Glossary
     ap.add_argument("--glossary", action="store_true",
                     help="Emit a Japanese term glossary alongside other outputs (suffix: .glossary.txt).")
+    ap.add_argument("--merge-gap", type=float, default=0.3,
+                    help="Seconds gap to merge consecutive turns by the same speaker (default: 0.3).")
     return ap.parse_args()
 
 # -----------------------
@@ -891,7 +950,11 @@ def main():
     else:
         audio_input = working_input
 
-    # Diarize (Pyannote) with timing — allow graceful skip when no token or --skip-diarization
+    # Honor HF cache dir to reduce repeated pulls
+    if args.hf_cache_dir:
+        os.environ["HF_HOME"] = args.hf_cache_dir
+
+    # Diarize (Pyannote) with timing — allow graceful skip when no token or --skip-diarization, and fallback on errors
     _t0_diar = time.perf_counter()
     diar_seconds = 0.0
     diar = None
@@ -901,13 +964,22 @@ def main():
         try:
             if (args.verbose or args.progress):
                 pbar_dz = tqdm(total=1, desc="Diarizing", disable=False)
+            # Choose revision: explicit CLI overrides repo@rev parsing
+            pipeline_name = args.diarization_pipeline
+            if args.diarization_revision:
+                if "@" in pipeline_name:
+                    pipeline_name = pipeline_name.split("@", 1)[0]
+                pipeline_name = f"{pipeline_name}@{args.diarization_revision}"
             diar = diarize_speakers(
                 audio_input=audio_input,
                 hf_token=args.hf_token,
-                pipeline_name=args.diarization_pipeline,
+                pipeline_name=pipeline_name,
                 num_speakers=args.num_speakers,
                 verbose=args.verbose
             )
+        except Exception as e:
+            logging.warning(f"[Main] Diarization failed ({e.__class__.__name__}: {e}); falling back to single-speaker.")
+            diar = None
         finally:
             if pbar_dz is not None:
                 pbar_dz.update(1)
@@ -916,7 +988,8 @@ def main():
     else:
         if not args.hf_token and not args.skip_diarization:
             logging.warning("[Main] --hf-token not provided; skipping diarization (single-speaker fallback).")
-        # Build a simple single-speaker annotation covering the whole audio
+    # Build a simple single-speaker annotation covering the whole audio when skipped or failed
+    if diar is None:
         diar = Annotation()
         diar[Segment(0.0, max((s['end'] for s in asr_segments), default=0.0))] = "Speaker 1"
 
@@ -926,6 +999,8 @@ def main():
 
     # Merge + per-segment language ID
     turns = build_turns(asr_segments, diar, show_progress=(args.verbose or args.progress))
+    # Coalesce small gaps between same-speaker turns
+    turns = merge_adjacent(turns, max_gap=float(args.merge_gap))
 
     # Per-speaker metrics (words and speaking time)
     speaker_stats = defaultdict(lambda: {"words": 0, "speaking_seconds": 0.0})
@@ -963,10 +1038,13 @@ def main():
         "vad_filter": not args.no_vad,
         "ffmpeg_denoise_model": args.ffmpeg_denoise_model or None,
         "diarization_pipeline": args.diarization_pipeline,
+        "diarization_revision": args.diarization_revision,
+        "hf_cache_dir": args.hf_cache_dir,
         "num_speakers": args.num_speakers,
         "skip_diarization": not do_diarization,
         "pyannote_device": device,
         "study_translate": not args.no_study_translate,
+        "merge_gap": float(args.merge_gap),
         "metrics": {
             "transcribe_seconds": round(asr_seconds, 3),
             "diarization_seconds": round(diar_seconds, 3),

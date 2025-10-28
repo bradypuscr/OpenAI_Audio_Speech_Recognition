@@ -42,6 +42,14 @@ pip install pykakasi faster-whisper argostranslate langid
 
 Usage:
     python test_audio_env.py --hf-token <YOUR_HUGGINGFACE_TOKEN>
+
+Behavior:
+- Verifies torch/CUDA/cuDNN
+- Checks cuDNN shared libs & key symbols
+- Tests torchaudio I/O & GPU transform
+- (Optional) Loads pyannote pipeline and faster-whisper tiny on chosen device
+- Preflight checker can *offer* to create a conda activate hook that prepends
+  the bundled cuDNN path to LD_LIBRARY_PATH (Linux/WSL) or PATH (Windows)
 """
 
 import importlib
@@ -52,6 +60,7 @@ import argparse
 import warnings
 import glob
 import ctypes
+import platform
 from pathlib import Path
 
 warnings.filterwarnings("ignore", message="The 'backend' parameter is not used by TorchCodec")
@@ -61,13 +70,17 @@ warnings.filterwarnings("ignore", message="The 'backend' parameter is not used b
 # ---------------------------------------------------------
 parser = argparse.ArgumentParser(description="Audio environment sanity checker")
 parser.add_argument("--hf-token", type=str, default=None, help="Hugging Face access token")
+parser.add_argument("--check-cudnn-path", action="store_true",
+                    help="Run cuDNN path checker first and offer a persistent fix (activation hook).")
 args = parser.parse_args()
 token = args.hf_token
+
+IS_WINDOWS = platform.system().lower().startswith("win")
 
 # ---------------------------------------------------------
 # UTILITIES
 # ---------------------------------------------------------
-def print_div(title):
+def print_div(title: str):
     print(f"\n=== {title} ===")
 
 def check_pkg(name):
@@ -81,6 +94,122 @@ def check_pkg(name):
         print(f"[FAIL] {name:15s} -> {type(e).__name__}: {e}")
         return None
 
+def conda_env_name_from_prefix(prefix: str) -> str:
+    return os.path.basename(prefix.rstrip("/\\"))
+
+def check_and_offer_fix_cudnn_path():
+    """
+    Detect PyTorch-bundled cuDNN path and ensure it's first in the runtime search path.
+    - Linux/WSL: LD_LIBRARY_PATH -> .../site-packages/nvidia/cudnn/lib
+    - Windows  : PATH            -> ...\site-packages\nvidia\cudnn\bin
+    Offers to create an activation hook under:
+      <env>/etc/conda/activate.d/99-cudnn-path.(sh|ps1)
+    """
+    conda_prefix = os.environ.get("CONDA_PREFIX")
+    if not conda_prefix:
+        print("⚠️ Not inside a conda env; activate your env first.")
+        return
+
+    if IS_WINDOWS:
+        bundled = os.path.join(conda_prefix, "Lib", "site-packages", "nvidia", "cudnn", "bin")
+        exists  = os.path.isdir(bundled)
+        path_env = os.environ.get("PATH", "")
+        parts = [p for p in path_env.split(";") if p]
+        front = parts[0] if parts else None
+
+        print_div("cuDNN PATH CHECK (Windows)")
+        print("Conda env     :", conda_prefix)
+        print("Bundled cuDNN :", bundled, "| exists:", exists)
+        print("PATH (front)  :", front or "(empty)")
+
+        if not exists:
+            print("\n❌ Bundled cuDNN directory not found. Reinstall PyTorch wheels (cu126):")
+            print("   pip install --force-reinstall --index-url https://download.pytorch.org/whl/cu126 torch torchvision torchaudio")
+            return
+
+        if front and os.path.normcase(front) == os.path.normcase(bundled):
+            print("\n✅ cuDNN path is already first in PATH. Nothing to do.")
+            return
+
+        print("\n⚠️ cuDNN path is not first in PATH.")
+        print("I can create an activation hook so this env always prepends the correct path.")
+        hook_dir = os.path.join(conda_prefix, "etc", "conda", "activate.d")
+        hook_ps1 = os.path.join(hook_dir, "99-cudnn-path.ps1")
+        contents = f'$env:PATH = "{bundled};" + $env:PATH\n'
+
+        print("\n--- WHAT I WOULD DO ---")
+        print(f"1) Create: {hook_ps1}")
+        print("   with contents:")
+        print("      " + contents.strip())
+        print(f"2) Re-activate the env:  conda deactivate && conda activate {conda_env_name_from_prefix(conda_prefix)}")
+
+        ans = input("\nProceed? [y/N]: ").strip().lower()
+        if ans != "y":
+            print("No changes made. For a temporary fix this session, run:")
+            print(f'  set PATH={bundled};%PATH%')
+            return
+
+        os.makedirs(hook_dir, exist_ok=True)
+        with open(hook_ps1, "w", encoding="utf-8") as f:
+            f.write(contents)
+        print("\n✅ Hook created.")
+        print(f"Now run:  conda deactivate && conda activate {conda_env_name_from_prefix(conda_prefix)}")
+        return
+
+    # Linux / WSL
+    bundled = os.path.join(conda_prefix, "lib", "python3.12", "site-packages", "nvidia", "cudnn", "lib")
+    exists  = os.path.isdir(bundled)
+    ld      = os.environ.get("LD_LIBRARY_PATH") or ""
+    parts   = [p for p in ld.split(":") if p]
+    front   = parts[0] if parts else None
+
+    print_div("cuDNN PATH CHECK (Linux/WSL)")
+    print("Conda env     :", conda_prefix)
+    print("Bundled cuDNN :", bundled, "| exists:", exists)
+    print("LD_LIBRARY_PATH (front):", front or "(empty)")
+
+    if not exists:
+        print("\n❌ Bundled cuDNN directory not found. Reinstall PyTorch wheels (cu126):")
+        print("   pip install --force-reinstall --index-url https://download.pytorch.org/whl/cu126 torch torchvision torchaudio")
+        return
+
+    if front == bundled:
+        print("\n✅ cuDNN path is already first in LD_LIBRARY_PATH. Nothing to do.")
+        return
+
+    print("\n⚠️ cuDNN path is not first in LD_LIBRARY_PATH.")
+    print("I can create an activation hook so this env always prepends the correct path.")
+    hook_dir = os.path.join(conda_prefix, "etc", "conda", "activate.d")
+    hook_sh  = os.path.join(hook_dir, "99-cudnn-path.sh")
+    contents = f'export LD_LIBRARY_PATH="{bundled}:$LD_LIBRARY_PATH"\n'
+
+    print("\n--- WHAT I WOULD DO ---")
+    print(f"1) Create: {hook_sh}")
+    print("   with contents:")
+    print("      " + contents.strip())
+    print(f"2) Re-activate the env:  conda deactivate && conda activate {conda_env_name_from_prefix(conda_prefix)}")
+
+    ans = input("\nProceed? [y/N]: ").strip().lower()
+    if ans != "y":
+        print("No changes made. For a temporary fix this session, run:")
+        print(f'  export LD_LIBRARY_PATH="{bundled}:$LD_LIBRARY_PATH"')
+        return
+
+    os.makedirs(hook_dir, exist_ok=True)
+    with open(hook_sh, "w", encoding="utf-8") as f:
+        f.write(contents)
+    try:
+        os.chmod(hook_sh, 0o755)
+    except Exception:
+        pass
+
+    print("\n✅ Hook created.")
+    print(f"Now run:  conda deactivate && conda activate {conda_env_name_from_prefix(conda_prefix)}")
+
+# Optional preflight
+if args.check_cudnn_path:
+    check_and_offer_fix_cudnn_path()
+
 cuda_results = {}
 
 # ---------------------------------------------------------
@@ -88,7 +217,8 @@ cuda_results = {}
 # ---------------------------------------------------------
 print_div("PYTHON & PATH")
 print(f"Python: {sys.version}")
-print(f"PATH   : {os.environ.get('PATH', '')[:120]}...\n")
+cut_path = os.environ.get('PATH', '') if IS_WINDOWS else os.environ.get('PATH', '')
+print(f"PATH   : {cut_path[:120]}...\n")
 
 # ---------------------------------------------------------
 # CORE LIBRARIES
@@ -136,21 +266,34 @@ try:
     print("cuDNN available:", cudnn_enabled)
     print("cuDNN version  :", cudnn.version())
 
-    # Attempt to locate libcudnn libraries (include bundled path that PyTorch wheels use)
+    # Locate libcudnn libraries (include PyTorch-bundled location)
     conda_prefix = os.environ.get("CONDA_PREFIX", "")
-    bundled_cudnn = os.path.join(conda_prefix, "lib", "python3.12", "site-packages", "nvidia", "cudnn", "lib")
-    cudnn_libs = (
-        glob.glob("/usr/lib/x86_64-linux-gnu/libcudnn*.so*")
-        + glob.glob(f"{conda_prefix}/lib/libcudnn*.so*")
-        + glob.glob("/usr/local/cuda/lib64/libcudnn*.so*")
-        + glob.glob(os.path.join(bundled_cudnn, "libcudnn*.so*"))
+    bundled_cudnn = os.path.join(
+        conda_prefix,
+        "Lib" if IS_WINDOWS else "lib",
+        "site-packages" if IS_WINDOWS else "python3.12/site-packages",
+        "nvidia", "cudnn", "bin" if IS_WINDOWS else "lib"
     )
+
+    cudnn_libs = []
+    if IS_WINDOWS:
+        # On Windows, DLL names differ; we just verify presence
+        if os.path.isdir(bundled_cudnn):
+            cudnn_libs.append(bundled_cudnn)
+    else:
+        cudnn_libs = (
+            glob.glob("/usr/lib/x86_64-linux-gnu/libcudnn*.so*")
+            + glob.glob(f"{conda_prefix}/lib/libcudnn*.so*")
+            + glob.glob("/usr/local/cuda/lib64/libcudnn*.so*")
+            + glob.glob(os.path.join(bundled_cudnn, "libcudnn*.so*"))
+        )
 
     if cudnn_libs:
         print(f"Found cuDNN libraries (sample): {cudnn_libs[:2]}{'...' if len(cudnn_libs)>2 else ''}")
         try:
-            _ = ctypes.CDLL(cudnn_libs[0])
-            print("✅ cuDNN shared library successfully loaded.")
+            if not IS_WINDOWS:
+                _ = ctypes.CDLL(cudnn_libs[0])
+            print("✅ cuDNN shared library presence confirmed.")
         except Exception as e:
             print("⚠️ cuDNN library found but failed to load:", e)
     else:
@@ -182,13 +325,21 @@ print_div("CUDNN SYMBOL INTEGRITY TEST")
 
 def test_cudnn_symbols():
     conda_prefix = os.environ.get("CONDA_PREFIX", "")
-    bundled = os.path.join(conda_prefix, "lib", "python3.12", "site-packages", "nvidia", "cudnn", "lib")
+    if IS_WINDOWS:
+        # Skip symbol probing on Windows; different API naming & DLL handling
+        cudnn_bin = os.path.join(conda_prefix, "Lib", "site-packages", "nvidia", "cudnn", "bin")
+        if os.path.isdir(cudnn_bin):
+            print(f"✅ Bundled cuDNN bin exists: {cudnn_bin}")
+            return True
+        print("⚠️ Bundled cuDNN bin not found.")
+        return False
 
+    bundled = os.path.join(conda_prefix, "lib", "python3.12", "site-packages", "nvidia", "cudnn", "lib")
     search_paths = [
         "/usr/lib/x86_64-linux-gnu/",
         f"{conda_prefix}/lib/",
         "/usr/local/cuda/lib64/",
-        bundled,  # <-- include PyTorch-bundled cuDNN
+        bundled,  # include PyTorch-bundled cuDNN
     ]
 
     possible_libs = []
@@ -226,7 +377,8 @@ cuda_results["cudnn_symbols"] = test_cudnn_symbols()
 # ---------------------------------------------------------
 print_div("TORCHAUDIO TEST")
 
-if torchaudio and torch:
+if 'torchaudio' in sys.modules and torch:
+    torchaudio = sys.modules['torchaudio']
     print("TorchAudio version:", torchaudio.__version__)
     try:
         sample_rate = 16000
@@ -235,7 +387,7 @@ if torchaudio and torch:
         test_file = Path("test_backend.wav")
 
         print("\n[Backend Save/Load Test]")
-        # Save with "soundfile" or "sox_io"; use "ffmpeg" for load-only (many builds can't save)
+        # Save with stable backends; ffmpeg often can't save in torchaudio
         for backend in ["soundfile", "sox_io"]:
             try:
                 torchaudio.save(test_file, waveform, sample_rate, backend=backend)
@@ -281,7 +433,7 @@ try:
     if not token:
         print("⚠️ No --hf-token provided — skipping model load.")
     else:
-        # Use modern kwarg name:
+        # modern kwarg name:
         pipeline = Pipeline.from_pretrained("pyannote/speaker-diarization-3.1", token=token)
         device = "cuda" if torch and torch.cuda.is_available() else "cpu"
         pipeline.to(torch.device(device))
@@ -290,7 +442,7 @@ try:
             print("✅ PyAnnote pipeline loaded on:", first_param.device)
         except Exception:
             print(f"✅ PyAnnote pipeline configured for device: {device}")
-        cuda_results["pyannote"] = device == "cuda"
+        cuda_results["pyannote"] = (device == "cuda")
 except Exception as e:
     print("PyAnnote test error:", e)
 

@@ -4,9 +4,12 @@
 """
 Whisper + Pyannote diarization + per-segment language ID (langid)
 + Study-friendly TXT with kana/romaji for Japanese segments
++ Multi-run experiments via --n-experiments
 -----------------------------------------------------------------
 - Inputs: an audio/video file path
-- Outputs: JSON / SRT / VTT / TXT / CSV / STUDY next to the input file (with a suffix)
+- Outputs (per run): JSON / SRT / VTT / TXT / CSV / STUDY next to the input file
+  using: <input><suffix>_expXX.<ext>
+- Summary: one CSV with knobs & quality proxies: <input><suffix>_experiments.csv
 - GPU ready: auto-detects CUDA and uses it when available
 - TorchCodec path (preferred) with automatic fallback to preloaded-audio if unavailable
 
@@ -60,7 +63,7 @@ import io
 import unicodedata
 import shutil
 import csv
-from collections import defaultdict
+from collections import defaultdict, Counter
 from pathlib import Path
 from dataclasses import dataclass, asdict
 from typing import List, Dict, Tuple, Union, Optional
@@ -126,14 +129,12 @@ def _atomic_write_text(path: Path, content: str, encoding: str = "utf-8"):
 # Utilities
 # -----------------------
 
-# ---- version helper (robust to packages without __version__)
 def _pkg_version(dist_name: str, import_name: str | None = None):
     """
     Prefer importlib.metadata version by distribution name (pip name),
     fall back to importing the module and reading __version__ if present.
     """
     try:
-        # Python 3.8+: importlib.metadata is in stdlib
         from importlib.metadata import version as _dist_version
         return _dist_version(dist_name)
     except Exception:
@@ -290,9 +291,11 @@ def transcribe_audio(
     verbose: bool = False,
     progress: bool = False,
     total_duration: Optional[float] = None,
-) -> List[Dict]:
+    # NEW: allow passing a preloaded model for reuse
+    _shared_model: Optional[WhisperModel] = None,
+) -> Tuple[List[Dict], Dict]:
     """
-    Run faster-whisper transcription.
+    Run faster-whisper transcription and return (segments, info_dict).
 
     - beam_size: wider search improves accuracy, slower decode.
     - word_timestamps: per-word timing (slower, more detail).
@@ -304,7 +307,8 @@ def transcribe_audio(
     device = "cuda" if torch.cuda.is_available() else "cpu"
     if verbose:
         logging.info(f"[Whisper] device={device} model={model_size} compute_type={compute_type} beam={beam_size} vad={vad_filter}")
-    model = WhisperModel(model_size, device=device, compute_type=compute_type)
+
+    model = _shared_model or WhisperModel(model_size, device=device, compute_type=compute_type)
 
     kwargs = dict(
         task="transcribe",
@@ -320,16 +324,24 @@ def transcribe_audio(
     if no_speech_threshold is not None: kwargs["no_speech_threshold"] = no_speech_threshold
 
     segments = []
-    # time-based progress bar using known media duration if available
+    info_fields = {
+        "language": None,
+        "language_probability": None,
+        "duration": None,
+    }
     pbar = None
     last_prog = 0.0
     try:
         if progress and total_duration and total_duration > 0:
             pbar = tqdm(total=total_duration, desc="Transcribing", unit="s", leave=True)
-        # Single transcription call driving progress
         segments_gen, info = model.transcribe(audio_path, **kwargs)
+        # capture info if available
+        for k in ("language", "language_probability", "duration"):
+            if hasattr(info, k):
+                info_fields[k] = getattr(info, k)
         for seg in segments_gen:
-            segments.append({"start": seg.start, "end": seg.end, "text": seg.text.strip()})
+            # seg may or may not have additional attributes; we keep only what we guarantee
+            segments.append({"start": seg.start, "end": seg.end, "text": (seg.text or "").strip()})
             if pbar is not None:
                 cur = max(0.0, float(seg.end))
                 delta = max(0.0, cur - last_prog)
@@ -338,7 +350,6 @@ def transcribe_audio(
                     last_prog = cur
     finally:
         if pbar is not None:
-            # Clamp to total if we overshot slightly and close
             try:
                 remaining = max(0.0, pbar.total - pbar.n)
                 if remaining:
@@ -348,9 +359,9 @@ def transcribe_audio(
             pbar.close()
 
     if verbose:
-        logging.info(f"[Whisper] primary language: {getattr(info, 'language', None)} "
-                     f"(p={getattr(info, 'language_probability', None)}) | segments={len(segments)}")
-    return segments
+        logging.info(f"[Whisper] primary language: {info_fields.get('language')} "
+                     f"(p={info_fields.get('language_probability')}) | segments={len(segments)}")
+    return segments, info_fields
 
 def diarize_speakers(
     audio_input: Union[str, dict],
@@ -371,7 +382,6 @@ def diarize_speakers(
     if verbose:
         logging.info(f"[Pyannote] loading pipeline: {pipeline_name}")
 
-    # Parse model id / revision
     model_id = pipeline_name
     revision = None
     if "@" in model_id:
@@ -388,7 +398,6 @@ def diarize_speakers(
         logging.info(f"[Pyannote] ffmpeg_cli_available=True | input_is_path={isinstance(audio_input, str)}")
 
     def _extract_annotation(result):
-        """Handle both old (Annotation) and new (DiarizeOutput) pipeline results."""
         if hasattr(result, "annotation"):
             return result.annotation
         return result
@@ -504,13 +513,12 @@ def merge_adjacent(turns: List[Turn], max_gap: float = 0.3) -> List[Turn]:
 def _format_settings_header(meta: Dict[str, Union[str,int,float,bool,None]]) -> str:
     pairs = []
     for k, v in meta.items():
-        if isinstance(v, (list, dict)):  # keep it simple and readable
+        if isinstance(v, (list, dict)):
             v = json.dumps(v, ensure_ascii=False)
         pairs.append(f"{k}: {v}")
     return "\n".join(pairs)
 
 def write_json(turns: List[Turn], path: Path):
-    # Preserve original schema (list of turns) for compatibility
     data = [asdict(t) for t in turns]
     content = json.dumps(data, ensure_ascii=False, indent=2)
     _atomic_write_text(path, content)
@@ -591,7 +599,7 @@ def build_glossary(turns: List[Turn]) -> List[Dict[str, str]]:
 
     # Sort by frequency desc, then term
     sorted_entries = sorted(entries.values(), key=lambda d: (-int(d["count"]), str(d["term"])))  # type: ignore
-    return [  # cast to list of str->str for writing
+    return [
         {
             "term": str(e.get("term", "")),
             "hira": str(e.get("hira", "")),
@@ -637,7 +645,6 @@ def write_glossary(gloss: List[Dict[str, str]], path: Path, settings_header: str
     _atomic_write_text(path, buf.getvalue())
 
 def write_srt(turns: List[Turn], path: Path, settings_header: str):
-    # SRT has no official comment; add a zero-length cue #0 with settings
     buf = io.StringIO()
     buf.write("0\n00:00:00,000 --> 00:00:00,001\n")
     buf.write("[SETTINGS]\n" + settings_header + "\n\n")
@@ -732,7 +739,6 @@ try:
     _HAS_ARGOS = True
 
     def _ensure_argos_models():
-        """Ensure the JA→EN and EN→ES models are installed (idempotent)."""
         try:
             argostranslate.package.update_package_index()
             available = argostranslate.package.get_available_packages()
@@ -754,7 +760,6 @@ try:
             logging.warning(f"[Argos] Model ensure failed: {e}")
 
     def translate_ja_to_es(text: str) -> str:
-        """Offline Japanese → English → Spanish using Argos Translate."""
         if not text or not text.strip():
             return ""
         try:
@@ -768,6 +773,35 @@ try:
 except Exception:
     _HAS_ARGOS = False
     def translate_ja_to_es(_): return ""
+
+# -----------------------
+# Small helpers for experiments
+# -----------------------
+
+def _majority_language(turns: List[Turn]) -> Tuple[str, float]:
+    langs = [t.language for t in turns if t.language and t.language != "und"]
+    if not langs:
+        return "und", 0.0
+    c = Counter(langs)
+    lang, n = c.most_common(1)[0]
+    return lang, n / len(langs)
+
+_STOPWORDS = set("""
+a an and the of to in for with on at from as by this that these those is are was were be been being do does did
+you your yours we our ours he she it they them i me my mine or but so if then because into out up down about
+over under again further once here there when where why how all any both each few more most other some such no nor not
+only own same than too very can will just don don't should could would might must
+""".split())
+
+def _extract_domain_terms(turns: List[Turn], max_terms: int = 25) -> str:
+    text = " ".join(t.text for t in turns)
+    tokens = re.findall(r"[A-Za-z][A-Za-z0-9\-]{2,}", text)
+    counts = Counter(tok for tok in tokens if tok.lower() not in _STOPWORDS)
+    # favor tokens with uppercase letters (proper nouns / acronyms)
+    boosted = [(tok, cnt * (1.5 if any(c.isupper() for c in tok) else 1.0)) for tok, cnt in counts.items()]
+    boosted.sort(key=lambda x: -x[1])
+    terms = [tok for tok, _ in boosted[:max_terms]]
+    return ", ".join(terms)
 
 # -----------------------
 # CLI
@@ -843,6 +877,13 @@ def parse_args():
                     help="Emit a Japanese term glossary alongside other outputs (suffix: .glossary.txt).")
     ap.add_argument("--merge-gap", type=float, default=0.3,
                     help="Seconds gap to merge consecutive turns by the same speaker (default: 0.3).")
+
+    # NEW — Experiments
+    ap.add_argument("--n-experiments", type=int, default=1,
+                    help="Run N transcription experiments with heuristic tweaks and write outputs per run. Default: 1 (baseline only).")
+    ap.add_argument("--experiment-scheme", choices=["auto", "accuracy", "speed"], default="auto",
+                    help="Heuristic preset priority: 'accuracy' (wider search first), 'speed' (cheaper tweaks first), 'auto' (balanced).")
+
     return ap.parse_args()
 
 # -----------------------
@@ -851,16 +892,13 @@ def parse_args():
 
 def main():
     args = parse_args()
-    _t0_total = time.perf_counter()
+    _t0_total_script = time.perf_counter()
     logging.basicConfig(
         level=logging.INFO if args.verbose else logging.WARNING,
         format="%(asctime)s - %(levelname)s - %(message)s"
     )
-    # Extra silencing when not verbose: kill all INFO/DEBUG emitted by 3rd parties
     if not args.verbose:
-        # Disable INFO and below globally (affects root and all child loggers)
         logging.disable(logging.INFO)
-        # Additionally clamp a few known noisy libraries
         for name, lvl in {
             "argostranslate": logging.ERROR,
             "ctranslate2": logging.WARNING,
@@ -892,84 +930,59 @@ def main():
             )
             sys.exit(1)
 
-    # Optional denoise/preprocess
-    temp_path = None
-    working_input = str(in_path)
-    if args.ffmpeg_denoise_model:
-        try:
+    # Optional denoise/preprocess — generate once to reuse across runs
+    temp_denoised = None
+    denoised_available = False
+    try:
+        if args.ffmpeg_denoise_model:
+            if args.verbose or args.progress:
+                tqdm(total=1, desc="Preparing denoised input").update(0)
+            temp_denoised = ffmpeg_denoise(str(in_path), args.ffmpeg_denoise_model, target_sr=16000)
+            denoised_available = True
             if args.verbose:
-                logging.info("[Preprocess] Denoising with FFmpeg arnndn")
-            pbar_dn = tqdm(total=1, desc="Denoising", disable=not (args.verbose or args.progress))
-            temp_path = ffmpeg_denoise(str(in_path), args.ffmpeg_denoise_model, target_sr=16000)
-            working_input = temp_path
-            pbar_dn.update(1); pbar_dn.close()
-        except Exception as e:
-            try:
-                pbar_dn.close()
-            except Exception:
-                pass
-            logging.warning(f"[Preprocess] Denoise failed: {e}. Continuing with original input.")
+                logging.info(f"[Preprocess] Denoised temp created: {temp_denoised}")
+    except Exception as e:
+        logging.warning(f"[Preprocess] Denoise failed: {e}. Continuing with original input only.")
+        temp_denoised = None
+        denoised_available = False
 
-    # Transcribe (Whisper) with timing
-    _t0_asr = time.perf_counter()
-    # Probe duration for a smoother progress bar
-    media_duration = probe_duration_ffprobe(working_input)
-    asr_segments = transcribe_audio(
-        working_input,
-        model_size=args.model_size,
-        compute_type=args.compute_type,
-        beam_size=args.beam_size,
-        vad_filter=not args.no_vad,
-        word_timestamps=not args.no_word_timestamps,
-        condition_on_previous_text=not args.no_condition_on_previous_text,
-        language=args.language or None,
-        patience=args.patience,
-        compression_ratio_threshold=args.compression_ratio_threshold,
-        no_speech_threshold=args.no_speech_threshold,
-        initial_prompt=args.initial_prompt,
-        verbose=args.verbose,
-        progress=(args.verbose or args.progress),
-        total_duration=media_duration,
-    )
-    asr_seconds = time.perf_counter() - _t0_asr
+    raw_input = str(in_path)
+    default_working_input = temp_denoised if denoised_available else raw_input
 
-    # Basic text/tempo metrics from ASR
-    total_words = sum(len(s["text"].split()) for s in asr_segments)
-    # sum of segment durations (spoken time proxy)
-    spoken_seconds = sum(max(0.0, (s["end"] - s["start"])) for s in asr_segments)
-    # full audio duration proxy from ASR (max end); robust and avoids extra probes
-    audio_seconds = max((s["end"] for s in asr_segments), default=0.0)
-    wpm_full = (total_words / (audio_seconds / 60.0)) if audio_seconds > 0 else None
-    wpm_spoken = (total_words / (spoken_seconds / 60.0)) if spoken_seconds > 0 else None
+    # Device & shared Whisper model
+    device = "cuda" if torch.cuda.is_available() else "cpu"
+    shared_model = WhisperModel(args.model_size, device=device, compute_type=args.compute_type)
 
-    # Decide diarization input
-    if args.preload_audio:
-        audio_input: Union[str, dict] = load_audio_ta(working_input)
-        if args.verbose:
-            logging.info("[Main] --preload-audio requested; bypassing FFmpeg CLI")
-    else:
-        audio_input = working_input
+    # Media duration cache per audio variant (for pbar)
+    duration_cache: Dict[str, Optional[float]] = {}
+    def _get_duration(p: str) -> Optional[float]:
+        if p not in duration_cache:
+            duration_cache[p] = probe_duration_ffprobe(p)
+        return duration_cache[p]
 
-    # Honor HF cache dir to reduce repeated pulls
-    if args.hf_cache_dir:
-        os.environ["HF_HOME"] = args.hf_cache_dir
-
-    # Diarize (Pyannote) with timing — allow graceful skip when no token or --skip-diarization, and fallback on errors
-    _t0_diar = time.perf_counter()
-    diar_seconds = 0.0
-    diar = None
-    do_diarization = (not args.skip_diarization) and bool(args.hf_token)
-    if do_diarization:
-        pbar_dz = None
+    # Diarization cache per audio variant
+    diar_cache: Dict[str, Annotation] = {}
+    def _get_diarization(audio_variant_path: str) -> Annotation:
+        if args.skip_diarization or (not args.hf_token):
+            ann = Annotation()
+            # single speaker covering full audio (use ASR max end later)
+            return ann  # We'll extend it later after ASR if needed
+        if audio_variant_path in diar_cache:
+            return diar_cache[audio_variant_path]
+        # Build diarization input based on --preload-audio
+        if args.preload_audio:
+            audio_input: Union[str, dict] = load_audio_ta(audio_variant_path)
+            if args.verbose:
+                logging.info("[Main] --preload-audio requested; bypassing FFmpeg CLI for diarization")
+        else:
+            audio_input = audio_variant_path
+        pipeline_name = args.diarization_pipeline
+        if args.diarization_revision:
+            if "@" in pipeline_name:
+                pipeline_name = pipeline_name.split("@", 1)[0]
+            pipeline_name = f"{pipeline_name}@{args.diarization_revision}"
+        pbar_dz = tqdm(total=1, desc="Diarizing", disable=not (args.verbose or args.progress))
         try:
-            if (args.verbose or args.progress):
-                pbar_dz = tqdm(total=1, desc="Diarizing", disable=False)
-            # Choose revision: explicit CLI overrides repo@rev parsing
-            pipeline_name = args.diarization_pipeline
-            if args.diarization_revision:
-                if "@" in pipeline_name:
-                    pipeline_name = pipeline_name.split("@", 1)[0]
-                pipeline_name = f"{pipeline_name}@{args.diarization_revision}"
             diar = diarize_speakers(
                 audio_input=audio_input,
                 hf_token=args.hf_token,
@@ -979,157 +992,333 @@ def main():
             )
         except Exception as e:
             logging.warning(f"[Main] Diarization failed ({e.__class__.__name__}: {e}); falling back to single-speaker.")
-            diar = None
+            diar = Annotation()
         finally:
-            if pbar_dz is not None:
-                pbar_dz.update(1)
-                pbar_dz.close()
-        diar_seconds = time.perf_counter() - _t0_diar
-    else:
-        if not args.hf_token and not args.skip_diarization:
-            logging.warning("[Main] --hf-token not provided; skipping diarization (single-speaker fallback).")
-    # Build a simple single-speaker annotation covering the whole audio when skipped or failed
-    if diar is None:
-        diar = Annotation()
-        diar[Segment(0.0, max((s['end'] for s in asr_segments), default=0.0))] = "Speaker 1"
+            try:
+                pbar_dz.update(1); pbar_dz.close()
+            except Exception:
+                pass
+        # Unwrap if needed
+        if hasattr(diar, "annotation"):
+            diar = diar.annotation
+        diar_cache[audio_variant_path] = diar
+        return diar
 
-    # Unwrap DiarizeOutput if needed
-    if hasattr(diar, "annotation"):
-        diar = diar.annotation
+    # Small inner function: run exactly one experiment with parameters
+    base = in_path.with_suffix("")
+    fmts = [f.strip().lower() for f in args.formats.split(",") if f.strip()]
+    all_outputs: Dict[int, Dict[str, Path]] = {}
+    summary_rows: List[Dict[str, Union[str, int, float, None, bool]]] = []
 
-    # Merge + per-segment language ID
-    turns = build_turns(asr_segments, diar, show_progress=(args.verbose or args.progress))
-    # Coalesce small gaps between same-speaker turns
-    turns = merge_adjacent(turns, max_gap=float(args.merge_gap))
+    def _language_consistency(turns: List[Turn]) -> Tuple[str, float]:
+        lang, frac = _majority_language(turns)
+        return lang, frac
 
-    # Per-speaker metrics (words and speaking time)
-    speaker_stats = defaultdict(lambda: {"words": 0, "speaking_seconds": 0.0})
-    for t in turns:
-        speaker_stats[t.speaker]["words"] += len(t.text.split())
-        speaker_stats[t.speaker]["speaking_seconds"] += max(0.0, t.end - t.start)
-    speaker_metrics = {
-        spk: {
-            "words": st["words"],
-            "speaking_seconds": round(st["speaking_seconds"], 3),
-            "wpm_spoken": (st["words"] / (st["speaking_seconds"] / 60.0)) if st["speaking_seconds"] > 0 else None,
+    def _compute_metrics(asr_segments: List[Dict], turns: List[Turn]) -> Dict[str, Union[int, float, None, Dict]]:
+        total_words = sum(len(s["text"].split()) for s in asr_segments)
+        spoken_seconds = sum(max(0.0, (s["end"] - s["start"])) for s in asr_segments)
+        audio_seconds = max((s["end"] for s in asr_segments), default=0.0)
+        wpm_full = (total_words / (audio_seconds / 60.0)) if audio_seconds > 0 else None
+        wpm_spoken = (total_words / (spoken_seconds / 60.0)) if spoken_seconds > 0 else None
+
+        # per-speaker stats
+        speaker_stats = defaultdict(lambda: {"words": 0, "speaking_seconds": 0.0})
+        for t in turns:
+            speaker_stats[t.speaker]["words"] += len(t.text.split())
+            speaker_stats[t.speaker]["speaking_seconds"] += max(0.0, t.end - t.start)
+        speaker_metrics = {
+            spk: {
+                "words": st["words"],
+                "speaking_seconds": round(st["speaking_seconds"], 3),
+                "wpm_spoken": (st["words"] / (st["speaking_seconds"] / 60.0)) if st["speaking_seconds"] > 0 else None,
+            }
+            for spk, st in speaker_stats.items()
         }
-        for spk, st in speaker_stats.items()
-    }
-
-    # Prepare settings meta
-    device = "cuda" if torch.cuda.is_available() else "cpu"
-
-    total_seconds = time.perf_counter() - _t0_total
-
-    meta = {
-        "input": str(in_path),
-        "used_input": working_input,
-        "device": device,
-        "whisper_model": args.model_size,
-        "compute_type": args.compute_type,
-        "beam_size": args.beam_size,
-        "word_timestamps": not args.no_word_timestamps,
-        "condition_on_previous_text": not args.no_condition_on_previous_text,
-        "language": args.language or None,
-        "patience": args.patience,
-        "compression_ratio_threshold": args.compression_ratio_threshold,
-        "no_speech_threshold": args.no_speech_threshold,
-        "initial_prompt": bool(args.initial_prompt),
-        "vad_filter": not args.no_vad,
-        "ffmpeg_denoise_model": args.ffmpeg_denoise_model or None,
-        "diarization_pipeline": args.diarization_pipeline,
-        "diarization_revision": args.diarization_revision,
-        "hf_cache_dir": args.hf_cache_dir,
-        "num_speakers": args.num_speakers,
-        "skip_diarization": not do_diarization,
-        "pyannote_device": device,
-        "study_translate": not args.no_study_translate,
-        "merge_gap": float(args.merge_gap),
-        "metrics": {
-            "transcribe_seconds": round(asr_seconds, 3),
-            "diarization_seconds": round(diar_seconds, 3),
-            "total_seconds": round(total_seconds, 3),
+        maj_lang, lang_frac = _language_consistency(turns)
+        return {
             "audio_seconds_estimate": round(audio_seconds, 3),
             "spoken_seconds_sum": round(spoken_seconds, 3),
             "total_words": int(total_words),
             "wpm_over_full_audio": (round(wpm_full, 2) if wpm_full is not None else None),
             "wpm_over_spoken_time": (round(wpm_spoken, 2) if wpm_spoken is not None else None),
             "per_speaker": speaker_metrics,
-        },
-        "versions": {
-            "python": sys.version.split()[0],
-            "torch": getattr(torch, "__version__", None),
-            "torchaudio": getattr(torchaudio, "__version__", None),
-            "faster-whisper": _pkg_version("faster-whisper", "faster_whisper"),
-            "pyannote.audio": _pkg_version("pyannote.audio", "pyannote.audio"),
-            "langid": _pkg_version("langid", "langid"),
+            "majority_language": maj_lang,
+            "language_consistency": round(float(lang_frac), 4) if lang_frac is not None else None,
         }
+
+    def _write_outputs(exp_id: int, turns: List[Turn], meta: Dict):
+        settings_header = _format_settings_header(meta)
+        run_suffix = f"{args.suffix}_exp{exp_id:02d}"
+        outputs: Dict[str, Path] = {}
+        # Emit machine-readable meta **only** when JSON is requested
+        if "json" in fmts:
+            meta_path = Path(f"{base}{run_suffix}.meta.json")
+            write_meta_json(meta, meta_path)
+            outputs["meta"] = meta_path
+            p = Path(f"{base}{run_suffix}.json")
+            write_json(turns, p)
+            outputs["json"] = p
+        if "srt" in fmts:
+            p = Path(f"{base}{run_suffix}.srt"); write_srt(turns, p, settings_header); outputs["srt"] = p
+        if "vtt" in fmts:
+            p = Path(f"{base}{run_suffix}.vtt"); write_vtt(turns, p, settings_header); outputs["vtt"] = p
+        if "txt" in fmts:
+            p = Path(f"{base}{run_suffix}.txt"); write_txt(turns, p, settings_header); outputs["txt"] = p
+        if "csv" in fmts:
+            p = Path(f"{base}{run_suffix}.csv"); write_csv(turns, p, settings_header); outputs["csv"] = p
+        if "study" in fmts:
+            p = Path(f"{base}{run_suffix}.study.txt")
+            write_study(turns, p, settings_header,
+                        include_hiragana=not args.study_no_hiragana,
+                        include_romaji=not args.study_no_romaji)
+            outputs["study"] = p
+        if args.glossary:
+            g = build_glossary(turns)
+            p = Path(f"{base}{run_suffix}.glossary.txt")
+            write_glossary(g, p, settings_header)
+            outputs["glossary"] = p
+        all_outputs[exp_id] = outputs
+
+    def run_experiment(exp_id: int, params: Dict) -> Tuple[List[Turn], Dict]:
+        """params keys: beam_size, vad_filter, condition_on_previous_text, language,
+                        patience, compression_ratio_threshold, no_speech_threshold, initial_prompt,
+                        use_denoised(bool)"""
+        using_denoised = bool(params.get("use_denoised", denoised_available))
+        working_input = (temp_denoised if (using_denoised and denoised_available) else raw_input)
+        media_duration = _get_duration(working_input)
+
+        # Transcribe
+        _t0_asr = time.perf_counter()
+        asr_segments, info_fields = transcribe_audio(
+            working_input,
+            model_size=args.model_size,
+            compute_type=args.compute_type,
+            beam_size=int(params.get("beam_size", args.beam_size)),
+            vad_filter=bool(params.get("vad_filter", not args.no_vad)),
+            word_timestamps=not args.no_word_timestamps,
+            condition_on_previous_text=bool(params.get("condition_on_previous_text", not args.no_condition_on_previous_text)),
+            language=params.get("language") or (args.language or None),
+            patience=params.get("patience", args.patience),
+            compression_ratio_threshold=params.get("compression_ratio_threshold", args.compression_ratio_threshold),
+            no_speech_threshold=params.get("no_speech_threshold", args.no_speech_threshold),
+            initial_prompt=params.get("initial_prompt", args.initial_prompt),
+            verbose=args.verbose,
+            progress=(args.verbose or args.progress),
+            total_duration=media_duration,
+            _shared_model=shared_model,
+        )
+        asr_seconds = time.perf_counter() - _t0_asr
+
+        # Diarization (reuse per variant)
+        _t0_diar = time.perf_counter()
+        diar = _get_diarization(working_input)
+        diar_seconds = time.perf_counter() - _t0_diar
+
+        # Fallback single speaker if diar is empty
+        if diar is None or (hasattr(diar, "labels") and len(list(diar.labels())) == 0):
+            diar = Annotation()
+            diar[Segment(0.0, max((s['end'] for s in asr_segments), default=0.0))] = "Speaker 1"
+        elif not hasattr(diar, "itersegments"):
+            # unwrap if needed
+            if hasattr(diar, "annotation"):
+                diar = diar.annotation
+
+        # Build turns and merge
+        turns = build_turns(asr_segments, diar, show_progress=(args.verbose or args.progress))
+        turns = merge_adjacent(turns, max_gap=float(args.merge_gap))
+
+        # Metrics
+        metrics = _compute_metrics(asr_segments, turns)
+
+        # Meta per run
+        total_seconds = asr_seconds + diar_seconds
+        meta = {
+            "experiment_id": exp_id,
+            "experiment_params": {
+                "beam_size": int(params.get("beam_size", args.beam_size)),
+                "vad_filter": bool(params.get("vad_filter", not args.no_vad)),
+                "condition_on_previous_text": bool(params.get("condition_on_previous_text", not args.no_condition_on_previous_text)),
+                "language": params.get("language") or (args.language or None),
+                "patience": params.get("patience", args.patience),
+                "compression_ratio_threshold": params.get("compression_ratio_threshold", args.compression_ratio_threshold),
+                "no_speech_threshold": params.get("no_speech_threshold", args.no_speech_threshold),
+                "initial_prompt": bool(params.get("initial_prompt", args.initial_prompt)),
+                "use_denoised": using_denoised and denoised_available,
+            },
+            "input": str(in_path),
+            "used_input": working_input,
+            "device": device,
+            "whisper_model": args.model_size,
+            "compute_type": args.compute_type,
+            "word_timestamps": not args.no_word_timestamps,
+            "merge_gap": float(args.merge_gap),
+            "diarization_pipeline": args.diarization_pipeline,
+            "diarization_revision": args.diarization_revision,
+            "hf_cache_dir": args.hf_cache_dir,
+            "num_speakers": args.num_speakers,
+            "skip_diarization": bool(args.skip_diarization or (not args.hf_token)),
+            "pyannote_device": device,
+            "study_translate": not args.no_study_translate,
+            "info_fields": info_fields,
+            "metrics": {
+                "transcribe_seconds": round(asr_seconds, 3),
+                "diarization_seconds": round(diar_seconds, 3),
+                "total_seconds": round(total_seconds, 3),
+                **metrics
+            },
+            "versions": {
+                "python": sys.version.split()[0],
+                "torch": getattr(torch, "__version__", None),
+                "torchaudio": getattr(torchaudio, "__version__", None),
+                "faster-whisper": _pkg_version("faster-whisper", "faster_whisper"),
+                "pyannote.audio": _pkg_version("pyannote.audio", "pyannote.audio"),
+                "langid": _pkg_version("langid", "langid"),
+            }
+        }
+
+        # Globals for study translate
+        globals()["_STUDY_TRANSLATE"] = not args.no_study_translate
+
+        _write_outputs(exp_id, turns, meta)
+
+        # Row for experiments summary
+        summary_rows.append({
+            "experiment_id": exp_id,
+            "beam_size": int(params.get("beam_size", args.beam_size)),
+            "vad_filter": bool(params.get("vad_filter", not args.no_vad)),
+            "condition_on_previous_text": bool(params.get("condition_on_previous_text", not args.no_condition_on_previous_text)),
+            "language": params.get("language") or (args.language or None),
+            "patience": params.get("patience", args.patience),
+            "compression_ratio_threshold": params.get("compression_ratio_threshold", args.compression_ratio_threshold),
+            "no_speech_threshold": params.get("no_speech_threshold", args.no_speech_threshold),
+            "initial_prompt_len": len(params.get("initial_prompt", args.initial_prompt) or "") or 0,
+            "use_denoised": using_denoised and denoised_available,
+            "transcribe_seconds": meta["metrics"]["transcribe_seconds"],
+            "diarization_seconds": meta["metrics"]["diarization_seconds"],
+            "total_seconds": meta["metrics"]["total_seconds"],
+            "audio_seconds_estimate": meta["metrics"]["audio_seconds_estimate"],
+            "spoken_seconds_sum": meta["metrics"]["spoken_seconds_sum"],
+            "total_words": meta["metrics"]["total_words"],
+            "wpm_over_full_audio": meta["metrics"]["wpm_over_full_audio"],
+            "wpm_over_spoken_time": meta["metrics"]["wpm_over_spoken_time"],
+            "majority_language": meta["metrics"]["majority_language"],
+            "language_consistency": meta["metrics"]["language_consistency"],
+        })
+
+        return turns, meta
+
+    # -----------------------
+    # Build experiment plan
+    # -----------------------
+    n = max(1, int(args.n_experiments))
+    baseline_params = {
+        "beam_size": args.beam_size,
+        "vad_filter": (not args.no_vad),
+        "condition_on_previous_text": (not args.no_condition_on_previous_text),
+        "language": (args.language or None),
+        "patience": args.patience,
+        "compression_ratio_threshold": args.compression_ratio_threshold,
+        "no_speech_threshold": args.no_speech_threshold,
+        "initial_prompt": args.initial_prompt,
+        "use_denoised": bool(denoised_available),  # baseline uses denoised if available
     }
-    settings_header = _format_settings_header(meta)
 
-    # Outputs — same directory as input
-    base = in_path.with_suffix("")  # drop extension
-    fmts = [f.strip().lower() for f in args.formats.split(",") if f.strip()]
-    out_paths: Dict[str, Path] = {}
+    experiment_params_list: List[Dict] = [baseline_params]  # exp 1 is baseline
 
-    # Make study translation flag visible to writer without changing its signature
-    globals()["_STUDY_TRANSLATE"] = not args.no_study_translate
+    # Run baseline first (so later heuristics can use signals from it)
+    baseline_turns, baseline_meta = run_experiment(1, baseline_params)
 
-    # Emit machine-readable meta **only** when JSON is requested
-    if "json" in fmts:
-        meta_path = Path(f"{base}{args.suffix}.meta.json")
-        write_meta_json(meta, meta_path)
-        out_paths["meta"] = meta_path
-        p = Path(f"{base}{args.suffix}.json")
-        write_json(turns, p)
-        out_paths["json"] = p
-    if "srt" in fmts:
-        p = Path(f"{base}{args.suffix}.srt"); write_srt(turns, p, settings_header); out_paths["srt"] = p
-    if "vtt" in fmts:
-        p = Path(f"{base}{args.suffix}.vtt"); write_vtt(turns, p, settings_header); out_paths["vtt"] = p
-    if "txt" in fmts:
-        p = Path(f"{base}{args.suffix}.txt"); write_txt(turns, p, settings_header); out_paths["txt"] = p
-    if "csv" in fmts:
-        p = Path(f"{base}{args.suffix}.csv"); write_csv(turns, p, settings_header); out_paths["csv"] = p
-    if "study" in fmts:
-        p = Path(f"{base}{args.suffix}.study.txt")
-        write_study(turns, p, settings_header,
-                    include_hiragana=not args.study_no_hiragana,
-                    include_romaji=not args.study_no_romaji)
-        out_paths["study"] = p
-    if args.glossary:
-        g = build_glossary(turns)
-        p = Path(f"{base}{args.suffix}.glossary.txt")
-        write_glossary(g, p, settings_header)
-        out_paths["glossary"] = p
+    # Heuristics pool (ordered)
+    base_used_denoised = baseline_params["use_denoised"]
+    majority_lang, lang_frac = _majority_language(baseline_turns)
+    auto_prompt = _extract_domain_terms(baseline_turns, max_terms=25)
 
-    if args.verbose:
-        for k, p in out_paths.items():
-            logging.info(f"Wrote {k.upper()}: {p}")
+    # start from a copy of baseline and override
+    H_list = []
 
-    print("Done. Outputs:")
-    for k, p in out_paths.items():
-        print(f"  - {k.upper()}: {p}")
+    # H1: wider beam + patience
+    H_list.append({**baseline_params, "beam_size": 8, "patience": (baseline_params["patience"] or 1.2)})
 
-    # ---- Console timing summary
-    try:
-        print("\nSummary:")
-        print(f"  Transcription time : {asr_seconds:.2f}s")
-        print(f"  Diarization time   : {diar_seconds:.2f}s")
-        print(f"  Total runtime      : {total_seconds:.2f}s")
-        if total_words:
-            print(f"  Words              : {int(total_words)}")
-        if wpm_full is not None:
-            print(f"  WPM (full audio)   : {wpm_full:.2f}")
-        if wpm_spoken is not None:
-            print(f"  WPM (spoken time)  : {wpm_spoken:.2f}")
-    except NameError:
-        # metrics not available (older script) — skip gracefully
-        pass
+    # H2: hallucination guard(s)
+    H_list.append({**baseline_params,
+                   "compression_ratio_threshold": (baseline_params["compression_ratio_threshold"] or 2.3),
+                   "no_speech_threshold": max(0.6, baseline_params["no_speech_threshold"] or 0.6)})
+
+    # H3: VAD off (recover clipped words)
+    H_list.append({**baseline_params, "vad_filter": False})
+
+    # H4: language lock to majority (if not already locked and confident enough)
+    if (not baseline_params["language"]) and (majority_lang != "und") and (lang_frac >= 0.6):
+        H_list.append({**baseline_params, "language": majority_lang})
+
+    # H5: disable condition_on_previous_text (topic drift cases)
+    H_list.append({**baseline_params, "condition_on_previous_text": False})
+
+    # H6: switch raw/denoised if possible
+    if denoised_available:
+        H_list.append({**baseline_params, "use_denoised": (not base_used_denoised)})
+
+    # H7: relaxed no_speech threshold
+    H_list.append({**baseline_params,
+                   "no_speech_threshold": min(0.45, baseline_params["no_speech_threshold"] or 0.45)})
+
+    # H8: smaller beam (sometimes helps choppy speakers)
+    H_list.append({**baseline_params, "beam_size": 3, "patience": None})
+
+    # H9: domain priming with auto prompt
+    if auto_prompt:
+        # keep short to avoid biasing too hard
+        short_prompt = ", ".join(auto_prompt.split(", ")[:20])
+        H_list.append({**baseline_params, "initial_prompt": short_prompt})
+
+    # Scheme re-ordering
+    if args.experiment_scheme == "accuracy":
+        order = [0, 1, 3, 5, 2, 6, 7, 8]  # prefer wider beam, guards, language lock, denoise swap
+    elif args.experiment_scheme == "speed":
+        order = [2, 7, 8, 4, 6, 1, 0, 5]  # cheap tweaks first
+    else:  # auto
+        order = list(range(len(H_list)))
+    H_list = [H_list[i] for i in order if i < len(H_list)]
+
+    # Fill remaining slots with mild variations if user requested more
+    extra_needed = max(0, n - 1 - len(H_list))
+    if extra_needed > 0:
+        alt_beams = [7, 6, 4, 2]
+        for b in alt_beams:
+            if extra_needed <= 0:
+                break
+            H_list.append({**baseline_params, "beam_size": b})
+            extra_needed -= 1
+
+    # Take only up to (n-1) heuristics
+    H_list = H_list[:max(0, n - 1)]
+
+    # Run the remaining experiments
+    for i, params in enumerate(H_list, start=2):
+        run_experiment(i, params)
+
+    # ---- Experiments summary CSV
+    summary_csv_path = Path(f"{base}{args.suffix}_experiments.csv")
+    df = pd.DataFrame(summary_rows)
+    # robust write
+    _atomic_write_text(summary_csv_path, df.to_csv(index=False))
+
+    # Print human summary
+    print("\nDone. Outputs by experiment:")
+    for exp_id, outs in sorted(all_outputs.items()):
+        print(f"  EXP {exp_id:02d}:")
+        for k, p in outs.items():
+            print(f"    - {k.upper():8s} {p}")
+    print(f"\nExperiments summary CSV: {summary_csv_path}")
+
+    # Global timing
+    print("\nSummary (script-level):")
+    print(f"  Experiments run : {n}")
+    print(f"  Total runtime   : {time.perf_counter() - _t0_total_script:.2f}s")
 
     # Cleanup temp
-    if temp_path:
-        try: os.unlink(temp_path)
+    if temp_denoised:
+        try: os.unlink(temp_denoised)
         except Exception: pass
 
 if __name__ == "__main__":

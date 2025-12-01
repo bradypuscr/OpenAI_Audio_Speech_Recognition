@@ -2,9 +2,18 @@
 # -*- coding: utf-8 -*-
 
 """
+conda py312
+
+
+python  /mnt/c/Users/epena/Projects/OpenAI_Audio_Speech_Recognition/whisper_diarize_multilang2.py --formats json,srt,txt,study   --beam-size 8   --patience 1.5   --compression-ratio-threshold 2.0   --no-speech-threshold 0.6   --initial-prompt "Clase de japonés en español. Sensei, alumno, romaji, hiragana, katakana, Kanji, partícula, conjugación, ejemplo, pregunta, respuesta, vocabulario, です, ます, は, を, が."   --num-speakers 11   --hf-token <here-toke> --glossary   --no-condition-on-previous-text   --progress --n-experiments 3 --experiment-scheme accuracy --allowed-languages "ja,es" --redecode-offlang /mnt/c/Users/epena/Downloads/Japones_Oct_2025/20251121.mp4
+"""
+
+
+"""
 Whisper + Pyannote diarization + per-segment language ID (langid)
 + Study-friendly TXT with kana/romaji for Japanese segments
 + Multi-run experiments via --n-experiments
++ JA/ES-only enforcement and off-language rescue
 -----------------------------------------------------------------
 - Inputs: an audio/video file path
 - Outputs (per run): JSON / SRT / VTT / TXT / CSV / STUDY next to the input file
@@ -54,10 +63,8 @@ import argparse
 import logging
 import subprocess
 import tempfile
-import textwrap
 import numpy as np
 import time
-import shlex
 import re
 import io
 import unicodedata
@@ -87,9 +94,9 @@ try:
     _kks = pykakasi.kakasi()  # single analyzer; modes are implicit in convert()
 
     def jp_with_readings(text: str):
-        tokens = _kks.convert(text)  # list of dicts with keys like: orig, hira, kana, hepburn, kunrei, passport
+        tokens = _kks.convert(text)  # list of dicts: orig, hira, kana, hepburn, kunrei, passport
         hira = " ".join(t.get("hira", "") for t in tokens).strip()
-        roma = " ".join(t.get("hepburn", "") for t in tokens).strip()  # choose 'kunrei' or 'passport' if preferred
+        roma = " ".join(t.get("hepburn", "") for t in tokens).strip()
         return hira, roma
 except Exception:
     _HAS_KAKASI = False
@@ -103,6 +110,54 @@ from pyannote.core import Annotation, Segment
 # --- torch/torchaudio for preload fallback + device detection
 import torch
 import torchaudio
+
+def _katakana_to_hiragana(s: str) -> str:
+    out = []
+    for ch in s:
+        code = ord(ch)
+        if 0x30A1 <= code <= 0x30F3:         # Katakana
+            out.append(chr(code - 0x60))      # -> Hiragana
+        else:
+            out.append(ch)
+    return "".join(out)
+
+def _contains_kanji(s: str) -> bool:
+    return any(0x4E00 <= ord(ch) <= 0x9FFF for ch in s)
+
+# Try Sudachi first
+try:
+    from sudachipy import dictionary as _sd_dict
+    from sudachipy import tokenizer as _sd_tok
+    _HAS_SUDACHI = True
+    _SUDACHI = _sd_dict.Dictionary().create()
+    _SUDACHI_MODE = _sd_tok.Tokenizer.SplitMode.C
+except Exception:
+    _HAS_SUDACHI = False
+
+# Try fugashi second
+try:
+    import fugashi
+    _HAS_FUGASHI = True
+    _FUGASHI = fugashi.Tagger()
+except Exception:
+    _HAS_FUGASHI = False
+
+# Filters
+_JA_POLITE_AUX = {
+    "です","ます","でした","でしたか","でしたね","ません","ませんでした",
+    "たい","たいです","ください","ましょう","おります","おりますか","ございます",
+}
+_JA_DROP_EXACT = {
+    # honorifics / suffixes / common function words
+    "さん","ちゃん","様","さま","君","くん",
+    "に","は","が","を","の","へ","で","と","や","か","も","な","ね","よ","ぞ","ぜ","さ",
+    "から","まで","より","だけ","しか","でも","とは","など","って","たり","ので","のは",
+    "これは","それでは","それを","それにも","この","その","どれだけ","どのくらい",
+}
+_ALLOWED_POS_TOP = {"名詞","動詞","形容詞","副詞"}
+# Noun subcategories to drop (Sudachi)
+_NOUN_SUB_DROP = {"数詞","助数詞","代名詞","接尾辞","非自立可能"}
+
 
 # -----------------------
 # Normalization / cleanup & atomic write helpers
@@ -297,12 +352,7 @@ def transcribe_audio(
     """
     Run faster-whisper transcription and return (segments, info_dict).
 
-    - beam_size: wider search improves accuracy, slower decode.
-    - word_timestamps: per-word timing (slower, more detail).
-    - condition_on_previous_text: improves cross-segment consistency.
     - language: lock language code if known (e.g., "en", "ja"); None = auto.
-    - patience, compression_ratio_threshold, no_speech_threshold: advanced controls.
-    - initial_prompt: prime the decoder with domain-specific terms/names.
     """
     device = "cuda" if torch.cuda.is_available() else "cpu"
     if verbose:
@@ -340,7 +390,6 @@ def transcribe_audio(
             if hasattr(info, k):
                 info_fields[k] = getattr(info, k)
         for seg in segments_gen:
-            # seg may or may not have additional attributes; we keep only what we guarantee
             segments.append({"start": seg.start, "end": seg.end, "text": (seg.text or "").strip()})
             if pbar is not None:
                 cur = max(0.0, float(seg.end))
@@ -375,7 +424,6 @@ def diarize_speakers(
     Compatible with both the new DiarizeOutput (v3.1+) and older Annotation formats.
     Automatically tries FFmpeg CLI first, then torchaudio fallback.
     """
-    # NOTE: main() guards calls to this when token is missing or diarization is skipped.
     if not hf_token:
         raise RuntimeError("Hugging Face token not found. This function expects a token.")
 
@@ -402,7 +450,6 @@ def diarize_speakers(
             return result.annotation
         return result
 
-    # 1) Try FFmpeg CLI path first
     if try_ffmpeg_first:
         try:
             if verbose:
@@ -414,7 +461,6 @@ def diarize_speakers(
             if verbose:
                 logging.warning(f"[Pyannote] FFmpeg path failed ({e.__class__.__name__}: {e}); falling back to torchaudio preload")
 
-    # 2) Fallback to preloaded torchaudio
     if isinstance(audio_input, str):
         audio_dict = load_audio_ta(audio_input)
     else:
@@ -428,20 +474,13 @@ def diarize_speakers(
 def assign_speakers_to_asr(asr: List[Dict], diarization) -> List[Tuple[Dict, str]]:
     """
     Map speakers from pyannote output to ASR segments.
-    Accepts:
-      - pyannote.core.Annotation
-      - wrapper with .annotation (Annotation)
-      - wrapper with .speaker_diarization iterable of (Segment, speaker) pairs
     """
-    # Case 1: already an Annotation
     if hasattr(diarization, "itertracks"):
         ann = diarization
-    # Case 2: wrapper exposing .annotation -> Annotation
     elif hasattr(diarization, "annotation"):
         ann = diarization.annotation
         if not hasattr(ann, "itertracks"):
             raise TypeError("Unwrapped .annotation is not an Annotation-like object.")
-    # Case 3: wrapper exposing .speaker_diarization -> build an Annotation
     elif hasattr(diarization, "speaker_diarization"):
         ann = Annotation()
         for turn, speaker in diarization.speaker_diarization:
@@ -476,7 +515,6 @@ def build_turns(asr_segments: List[Dict], diarization: Annotation, show_progress
     turns: List[Turn] = []
     it = tqdm(speaker_assigned, desc="Tagging language / merging", disable=not show_progress)
     for seg, spk in it:
-        # Clean punctuation/spacing and normalize to NFC before downstream use
         cleaned_text = _normalize_text_nfc(seg["text"])
         code, score = detect_language_for_text(cleaned_text)
         turns.append(Turn(
@@ -528,7 +566,6 @@ def write_meta_json(meta: Dict[str, Union[str,int,float,bool,None]], path: Path)
     _atomic_write_text(path, content)
 
 def _format_ts_for_example(seconds: float) -> str:
-    # hh:mm:ss (no milliseconds) for compact examples
     ms = int(round(seconds * 1000.0))
     hrs = ms // 3_600_000
     ms %= 3_600_000
@@ -538,7 +575,6 @@ def _format_ts_for_example(seconds: float) -> str:
     return f"{hrs:02d}:{mins:02d}:{secs:02d}"
 
 def _looks_japanese_text(s: str) -> bool:
-    # mirrors looks_japanese but works on small tokens too
     for ch in s:
         code = ord(ch)
         if (0x3040 <= code <= 0x309F) or (0x30A0 <= code <= 0x30FF) or (0x4E00 <= code <= 0x9FFF):
@@ -547,50 +583,143 @@ def _looks_japanese_text(s: str) -> bool:
 
 def build_glossary(turns: List[Turn]) -> List[Dict[str, str]]:
     """
-    Collect unique Japanese terms from JA segments (or lines that look Japanese),
-    using pykakasi tokenization to get readings. Count frequencies and keep first example time.
+    Build a clean, de-duplicated glossary:
+      - Lemmatize (Sudachi -> fugashi -> heuristic fallback)
+      - Keep content words only (N/V/Adj/Adv; + proper nouns)
+      - Drop particles/auxiliaries/polite/suffix tokens/honorifics
+      - Key by lemma (normalized form) so inflection variants collapse
     """
     entries: Dict[str, Dict[str, Union[str, int, float]]] = {}
-    for t in turns:
-        if not (t.language == "ja" or _looks_japanese_text(t.text)):
-            continue
-        text = t.text.strip()
-        if not text:
-            continue
-        # Tokenize via pykakasi if available; else very rough fallback by Kanji/Hiragana/Katakana runs
-        tokens = []
-        if _HAS_KAKASI:
-            for token in _kks.convert(text):
-                orig = (token.get("orig") or "").strip()
-                if not orig or not _looks_japanese_text(orig):
-                    continue
-                hira = (token.get("hira") or "").strip()
-                roma = (token.get("hepburn") or "").strip()
-                tokens.append((orig, hira, roma))
+
+    def _add_entry(lemma: str, reading_hira: str, example: str, first_ts: float):
+        key = _normalize_text_nfc(lemma)
+        key = re.sub(r"\s+", "", key)
+        if not key:
+            return
+
+        # Drop obvious noise
+        if key in _JA_DROP_EXACT:
+            return
+        if key in _JA_POLITE_AUX:
+            return
+        if (len(key) <= 1) and (not _contains_kanji(key)):
+            return
+
+        if key not in entries:
+            entries[key] = {
+                "term": lemma,
+                "hira": reading_hira,
+                "roma": _normalize_text_nfc(pykakasi.kakasi().convert(lemma)[0]["hepburn"]) if _HAS_KAKASI else "",
+                "count": 1,
+                "first_ts": _format_ts_for_example(first_ts),
+                "example": example,
+            }
         else:
-            # Fallback: split by non-CJK and keep CJK runs as "terms"
-            for m in re.finditer(r"[\u3040-\u30FF\u4E00-\u9FFF]+", text):
-                term = m.group(0)
-                tokens.append((term, "", ""))
+            e = entries[key]
+            e["count"] = int(e.get("count", 0)) + 1  # type: ignore
+            # fill missing reading if any
+            if not e.get("hira") and reading_hira:
+                e["hira"] = reading_hira  # type: ignore
 
-        for orig, hira, roma in tokens:
-            if not orig:
+    # -------- Path A: Sudachi (best) --------
+    if _HAS_SUDACHI:
+        for t in turns:
+            # keep only JP-looking lines or explicitly flagged as JA
+            if not (t.language == "ja" or _looks_japanese_text(t.text)):
                 continue
-            if orig not in entries:
-                entries[orig] = {
-                    "term": orig,
-                    "hira": hira,
-                    "roma": roma,
-                    "count": 0,
-                    "first_ts": _format_ts_for_example(t.start),
-                    "example": text,
-                }
-            entries[orig]["count"] += 1  # type: ignore
+            text = _normalize_text_nfc(t.text or "").strip()
+            if not text:
+                continue
+            morps = _SUDACHI.tokenize(text, _SUDACHI_MODE)
 
-    # Optional Spanish translation (only if Argos present and study_translate was requested)
+            for m in morps:
+                pos = m.part_of_speech()  # tuple, e.g. ('名詞','普通名詞','一般',...)
+                top = pos[0] if pos else ""
+                sub = pos[1] if len(pos) > 1 else ""
+
+                # POS gate
+                if top not in _ALLOWED_POS_TOP:
+                    continue
+                # drop noun subcats like particles/suffix/pronoun-ish
+                if top == "名詞" and sub in _NOUN_SUB_DROP:
+                    continue
+                # dictionary/normalized form
+                lemma = _normalize_text_nfc(m.dictionary_form() or m.normalized_form() or m.surface())
+                if lemma in _JA_POLITE_AUX or lemma in _JA_DROP_EXACT:
+                    continue
+
+                # reading -> hiragana
+                reading = m.reading_form() or ""
+                reading_hira = _katakana_to_hiragana(reading)
+
+                # final safety: very short kana-only -> drop (unless proper noun)
+                if (len(lemma) <= 1) and (not _contains_kanji(lemma)) and not ("固有名詞" in pos):
+                    continue
+
+                _add_entry(lemma, reading_hira, text, t.start)
+
+    # -------- Path B: fugashi (good) --------
+    elif _HAS_FUGASHI:
+        for t in turns:
+            if not (t.language == "ja" or _looks_japanese_text(t.text)):
+                continue
+            text = _normalize_text_nfc(t.text or "").strip()
+            if not text:
+                continue
+            for m in _FUGASHI(text):
+                # fugashi/unidic-lite features vary; be defensive
+                pos = m.feature.get("pos1", "") or m.feature.pos1 if hasattr(m.feature, "pos1") else ""
+                pos2 = m.feature.get("pos2", "") if isinstance(m.feature, dict) else ""
+                top = pos
+                if top not in _ALLOWED_POS_TOP:
+                    continue
+                if top == "名詞" and pos2 in _NOUN_SUB_DROP:
+                    continue
+
+                lemma = m.feature.get("lemma", "") or m.feature.get("base_form", "") or m.surface
+                lemma = _normalize_text_nfc(lemma)
+                if lemma in _JA_POLITE_AUX or lemma in _JA_DROP_EXACT:
+                    continue
+
+                reading = m.feature.get("reading", "") or ""
+                reading_hira = _katakana_to_hiragana(reading)
+
+                if (len(lemma) <= 1) and (not _contains_kanji(lemma)):
+                    continue
+
+                _add_entry(lemma, reading_hira, text, t.start)
+
+    # -------- Path C: Heuristic fallback (pykakasi only) --------
+    else:
+        for t in turns:
+            if not (t.language == "ja" or _looks_japanese_text(t.text)):
+                continue
+            text = _normalize_text_nfc(t.text or "").strip()
+            if not text:
+                continue
+
+            # crude "content term" extraction: CJK runs length>=2 or contains kanji
+            for m in re.finditer(r"[\u3040-\u30FF\u4E00-\u9FFF]+", text):
+                term = _normalize_text_nfc(m.group(0))
+                # strip common polite endings (coarse)
+                term = re.sub(r"(でしたか|でした|たいです|てください|ましょう|ます|です)$", "", term)
+                if term in _JA_POLITE_AUX or term in _JA_DROP_EXACT:
+                    continue
+                if (len(term) <= 1) and (not _contains_kanji(term)):
+                    continue
+
+                # reading/roma via pykakasi if available
+                if _HAS_KAKASI:
+                    conv = _kks.convert(term)
+                    hira = _normalize_text_nfc("".join(x.get("hira","") for x in conv))
+                else:
+                    hira = ""
+                _add_entry(term, hira, text, t.start)
+
+    # Optional Spanish translation for study sheet
     if globals().get("_HAS_ARGOS") and globals().get("_STUDY_TRANSLATE", False):
         for k, e in entries.items():
-            term = e["term"]  # type: ignore
+            term = str(e.get("term", ""))
             try:
                 es = translate_ja_to_es(term) or ""
             except Exception:
@@ -610,13 +739,35 @@ def build_glossary(turns: List[Turn]) -> List[Dict[str, str]]:
             "es": str(e.get("es", "")) if "es" in e else "",
         } for e in sorted_entries
     ]
+    
+    # Deduplicate keys that differ only by spacing or Unicode form
+    entries = { _normalize_text_nfc(k): v for k, v in entries.items() }
+
+    if globals().get("_HAS_ARGOS") and globals().get("_STUDY_TRANSLATE", False):
+        for k, e in entries.items():
+            term = e["term"]  # type: ignore
+            try:
+                es = translate_ja_to_es(term) or ""
+            except Exception:
+                es = ""
+            e["es"] = es  # type: ignore
+
+    sorted_entries = sorted(entries.values(), key=lambda d: (-int(d["count"]), str(d["term"])))  # type: ignore
+    return [
+        {
+            "term": str(e.get("term", "")),
+            "hira": str(e.get("hira", "")),
+            "roma": str(e.get("roma", "")),
+            "count": str(e.get("count", "")),
+            "first_ts": str(e.get("first_ts", "")),
+            "example": str(e.get("example", "")),
+            "es": str(e.get("es", "")) if "es" in e else "",
+        } for e in sorted_entries
+    ]
 
 def write_glossary(gloss: List[Dict[str, str]], path: Path, settings_header: str):
     """
-    Write a human-friendly glossary. One entry per block:
-      term | hira | roma | count | first_ts
-      es? (if present)
-      example: ...
+    Write a human-friendly glossary. One entry per block.
     """
     buf = io.StringIO()
     buf.write("# Glossary (auto-collected from Japanese segments)\n")
@@ -628,7 +779,6 @@ def write_glossary(gloss: List[Dict[str, str]], path: Path, settings_header: str
         _atomic_write_text(path, buf.getvalue())
         return
     for e in gloss:
-        # Normalize key fields
         e = {k: _normalize_text_nfc(v or "") for k, v in e.items()}
         header = f"{e['term']}"
         extras = []
@@ -645,6 +795,7 @@ def write_glossary(gloss: List[Dict[str, str]], path: Path, settings_header: str
     _atomic_write_text(path, buf.getvalue())
 
 def write_srt(turns: List[Turn], path: Path, settings_header: str):
+    # SRT has no official comment; add a zero-length cue #0 with settings
     buf = io.StringIO()
     buf.write("0\n00:00:00,000 --> 00:00:00,001\n")
     buf.write("[SETTINGS]\n" + settings_header + "\n\n")
@@ -684,8 +835,6 @@ def write_txt(turns: List[Turn], path: Path, settings_header: str):
     _atomic_write_text(path, buf.getvalue())
 
 def write_csv(turns: List[Turn], path: Path, settings_header: str):
-    # Prepend commented header lines, then write CSV with robust quoting
-    # Build entire content in-memory to ensure atomic replace after success
     header = io.StringIO()
     header.write("# SETTINGS\n")
     for line in settings_header.splitlines():
@@ -739,6 +888,7 @@ try:
     _HAS_ARGOS = True
 
     def _ensure_argos_models():
+        """Ensure JA→EN and EN→ES models are installed (idempotent)."""
         try:
             argostranslate.package.update_package_index()
             available = argostranslate.package.get_available_packages()
@@ -760,6 +910,7 @@ try:
             logging.warning(f"[Argos] Model ensure failed: {e}")
 
     def translate_ja_to_es(text: str) -> str:
+        """Offline Japanese → English → Spanish using Argos Translate."""
         if not text or not text.strip():
             return ""
         try:
@@ -775,7 +926,7 @@ except Exception:
     def translate_ja_to_es(_): return ""
 
 # -----------------------
-# Small helpers for experiments
+# Experiment helpers
 # -----------------------
 
 def _majority_language(turns: List[Turn]) -> Tuple[str, float]:
@@ -797,11 +948,84 @@ def _extract_domain_terms(turns: List[Turn], max_terms: int = 25) -> str:
     text = " ".join(t.text for t in turns)
     tokens = re.findall(r"[A-Za-z][A-Za-z0-9\-]{2,}", text)
     counts = Counter(tok for tok in tokens if tok.lower() not in _STOPWORDS)
-    # favor tokens with uppercase letters (proper nouns / acronyms)
     boosted = [(tok, cnt * (1.5 if any(c.isupper() for c in tok) else 1.0)) for tok, cnt in counts.items()]
     boosted.sort(key=lambda x: -x[1])
     terms = [tok for tok, _ in boosted[:max_terms]]
     return ", ".join(terms)
+
+# -----------------------
+# JA/ES enforcement helpers
+# -----------------------
+
+def _ffmpeg_cut_to_tmp(src_path: str, start: float, end: float) -> str:
+    """Cut [start,end] into a temp WAV (mono 16k). Returns path."""
+    start = max(0.0, float(start))
+    end = max(start, float(end))
+    tmp = tempfile.NamedTemporaryFile(prefix="clip_", suffix=".wav", delete=False)
+    tmp.close()
+    cmd = [
+        "ffmpeg","-y","-nostdin",
+        "-ss", f"{start:.3f}", "-to", f"{end:.3f}",
+        "-i", src_path, "-vn","-ac","1","-ar","16000", tmp.name
+    ]
+    proc = subprocess.run(cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE, check=False)
+    if proc.returncode != 0:
+        try: os.unlink(tmp.name)
+        except Exception: pass
+        raise RuntimeError(f"ffmpeg cut failed: {proc.stderr.decode(errors='ignore')[:400]}")
+    return tmp.name
+
+def _force_transcribe_window(shared_model: WhisperModel, audio_path: str,
+                             start: float, end: float, lang: str,
+                             beam_size: int, condition_on_previous_text: bool,
+                             initial_prompt: Optional[str]) -> str:
+    """Decode a short window with language forced. Returns concatenated text."""
+    path = _ffmpeg_cut_to_tmp(audio_path, start, end)
+    try:
+        segs, _info = shared_model.transcribe(
+            path,
+            task="transcribe",
+            language=lang,
+            beam_size=beam_size,
+            vad_filter=False,                # don't re-VAD tiny windows
+            word_timestamps=False,
+            condition_on_previous_text=condition_on_previous_text,
+            initial_prompt=initial_prompt
+        )
+        txt = " ".join((s.text or "").strip() for s in segs)
+        return _normalize_text_nfc(txt)
+    finally:
+        try: os.unlink(path)
+        except Exception: pass
+
+def _speaker_majorities(turns: List[Turn]) -> Dict[str, Tuple[str, float]]:
+    """Return {speaker: (majority_lang, frac)}."""
+    by_spk = defaultdict(list)
+    for t in turns:
+        if t.language and t.language != "und":
+            by_spk[t.speaker].append(t.language)
+    out = {}
+    for spk, langs in by_spk.items():
+        if not langs:
+            out[spk] = ("und", 0.0)
+        else:
+            c = Counter(langs)
+            lang, n = c.most_common(1)[0]
+            out[spk] = (lang, n/len(langs))
+    return out
+
+_SP_DIAC = re.compile(r"[áéíóúñÁÉÍÓÚÑ¿¡]")
+
+def _guess_target_lang(text: str) -> Optional[str]:
+    """Heuristic guess for JA vs ES."""
+    if looks_japanese(text):
+        return "ja"
+    if _SP_DIAC.search(text):
+        return "es"
+    lbl, score = langid.classify(text or "")
+    if lbl in ("ja","es") and score >= 0.7:
+        return lbl
+    return None
 
 # -----------------------
 # CLI
@@ -851,9 +1075,9 @@ def parse_args():
     ap.add_argument("--diarization-pipeline", default="pyannote/speaker-diarization-3.1",
                     help="Pyannote pipeline repo id (default: pyannote/speaker-diarization-3.1). Accepts 'repo@revision'.")
     ap.add_argument("--diarization-revision", default=None,
-                    help="Optional explicit revision for the diarization pipeline (overrides any '@rev' in --diarization-pipeline).")
+                    help="Optional explicit revision for the diarization pipeline.")
     ap.add_argument("--hf-cache-dir", default=None,
-                    help="Optional Hugging Face cache directory to reduce repeated downloads (sets HF_HOME for this run).")
+                    help="Optional Hugging Face cache directory to reduce repeated downloads (sets HF_HOME).")
     ap.add_argument("--num-speakers", type=int, default=None,
                     help="If known, fix the number of speakers (improves diarization).")
     ap.add_argument("--preload-audio", action="store_true",
@@ -878,11 +1102,27 @@ def parse_args():
     ap.add_argument("--merge-gap", type=float, default=0.3,
                     help="Seconds gap to merge consecutive turns by the same speaker (default: 0.3).")
 
-    # NEW — Experiments
+    # Experiments
     ap.add_argument("--n-experiments", type=int, default=1,
-                    help="Run N transcription experiments with heuristic tweaks and write outputs per run. Default: 1 (baseline only).")
+                    help="Run N transcription experiments with heuristic tweaks. Default: 1 (baseline only).")
     ap.add_argument("--experiment-scheme", choices=["auto", "accuracy", "speed"], default="auto",
-                    help="Heuristic preset priority: 'accuracy' (wider search first), 'speed' (cheaper tweaks first), 'auto' (balanced).")
+                    help="Heuristic preset priority: accuracy/speed/auto.")
+
+    # JA/ES enforcement / rescue
+    ap.add_argument("--allowed-languages", default="ja,es",
+                    help="Comma-separated ISO 639-1 codes allowed for output. Default: ja,es.")
+    ap.add_argument("--redecode-offlang", action="store_true",
+                    help="If a turn language is not in --allowed-languages, re-decode that window with JA/ES and keep the better one.")
+    ap.add_argument("--redecode-pad", type=float, default=0.25,
+                    help="Seconds of audio added on each side when re-decoding a turn window. Default: 0.25.")
+    ap.add_argument("--redecode-max-seg-sec", type=float, default=30.0,
+                    help="Max seconds per turn eligible for re-decode. Default: 30.")
+    ap.add_argument("--redecode-max-total-sec", type=float, default=180.0,
+                    help="Budget cap (s) of audio to re-decode across all turns. Default: 180.")
+    ap.add_argument("--enforce-lang-by-speaker", action="store_true",
+                    help="Lock each speaker to their majority language (if JA/ES and confident) and re-decode their turns.")
+    ap.add_argument("--enforce-lang-threshold", type=float, default=0.7,
+                    help="Minimum fraction for a speaker's majority language to qualify for locking. Default: 0.7.")
 
     return ap.parse_args()
 
@@ -917,7 +1157,7 @@ def main():
         logging.error(f"Input not found: {in_path}")
         sys.exit(1)
 
-    # ---- Early FFmpeg/FFprobe guards (fail fast with clear hints)
+    # ---- Early FFmpeg/FFprobe guards (fail fast)
     for tool in ("ffmpeg", "ffprobe"):
         if shutil.which(tool) is None:
             print(
@@ -935,12 +1175,12 @@ def main():
     denoised_available = False
     try:
         if args.ffmpeg_denoise_model:
-            if args.verbose or args.progress:
-                tqdm(total=1, desc="Preparing denoised input").update(0)
+            if args.verbose:
+                logging.info("[Preprocess] Denoising with FFmpeg arnndn")
+            pbar_dn = tqdm(total=1, desc="Preparing denoised input", disable=not (args.verbose or args.progress))
             temp_denoised = ffmpeg_denoise(str(in_path), args.ffmpeg_denoise_model, target_sr=16000)
             denoised_available = True
-            if args.verbose:
-                logging.info(f"[Preprocess] Denoised temp created: {temp_denoised}")
+            pbar_dn.update(1); pbar_dn.close()
     except Exception as e:
         logging.warning(f"[Preprocess] Denoise failed: {e}. Continuing with original input only.")
         temp_denoised = None
@@ -965,8 +1205,7 @@ def main():
     def _get_diarization(audio_variant_path: str) -> Annotation:
         if args.skip_diarization or (not args.hf_token):
             ann = Annotation()
-            # single speaker covering full audio (use ASR max end later)
-            return ann  # We'll extend it later after ASR if needed
+            return ann  # Fallback handled later
         if audio_variant_path in diar_cache:
             return diar_cache[audio_variant_path]
         # Build diarization input based on --preload-audio
@@ -998,13 +1237,12 @@ def main():
                 pbar_dz.update(1); pbar_dz.close()
             except Exception:
                 pass
-        # Unwrap if needed
         if hasattr(diar, "annotation"):
             diar = diar.annotation
         diar_cache[audio_variant_path] = diar
         return diar
 
-    # Small inner function: run exactly one experiment with parameters
+    # Outputs collector
     base = in_path.with_suffix("")
     fmts = [f.strip().lower() for f in args.formats.split(",") if f.strip()]
     all_outputs: Dict[int, Dict[str, Path]] = {}
@@ -1079,15 +1317,19 @@ def main():
             outputs["glossary"] = p
         all_outputs[exp_id] = outputs
 
+    # -----------------------
+    # Single experiment runner (includes JA/ES enforcement)
+    # -----------------------
     def run_experiment(exp_id: int, params: Dict) -> Tuple[List[Turn], Dict]:
-        """params keys: beam_size, vad_filter, condition_on_previous_text, language,
-                        patience, compression_ratio_threshold, no_speech_threshold, initial_prompt,
-                        use_denoised(bool)"""
+        """
+        Run a single experiment; returns (turns, meta).
+        """
+        # Choose audio variant for this run
         using_denoised = bool(params.get("use_denoised", denoised_available))
         working_input = (temp_denoised if (using_denoised and denoised_available) else raw_input)
         media_duration = _get_duration(working_input)
 
-        # Transcribe
+        # --- Transcribe
         _t0_asr = time.perf_counter()
         asr_segments, info_fields = transcribe_audio(
             working_input,
@@ -1109,28 +1351,122 @@ def main():
         )
         asr_seconds = time.perf_counter() - _t0_asr
 
-        # Diarization (reuse per variant)
+        # --- Diarization (reuse per variant)
         _t0_diar = time.perf_counter()
         diar = _get_diarization(working_input)
         diar_seconds = time.perf_counter() - _t0_diar
 
-        # Fallback single speaker if diar is empty
+        # Fallback to single speaker if needed
         if diar is None or (hasattr(diar, "labels") and len(list(diar.labels())) == 0):
             diar = Annotation()
             diar[Segment(0.0, max((s['end'] for s in asr_segments), default=0.0))] = "Speaker 1"
         elif not hasattr(diar, "itersegments"):
-            # unwrap if needed
             if hasattr(diar, "annotation"):
                 diar = diar.annotation
 
-        # Build turns and merge
+        # --- Build & merge turns
         turns = build_turns(asr_segments, diar, show_progress=(args.verbose or args.progress))
         turns = merge_adjacent(turns, max_gap=float(args.merge_gap))
 
-        # Metrics
+        # --- JA/ES Enforcement / off-language rescue (optional)
+        rescued_turns_count = 0
+        redecode_seconds_spent = 0.0
+
+        if args.redecode_offlang or args.enforce_lang_by_speaker:
+            allowed = {c.strip().lower() for c in (args.allowed_languages or "").split(",") if c.strip()}
+            if not allowed:
+                allowed = {"ja", "es"}
+
+            # Speaker majorities (if enabled)
+            spk_major = _speaker_majorities(turns) if args.enforce_lang_by_speaker else {}
+
+            def _decide_target_for_turn(t: Turn) -> Optional[str]:
+                # If already allowed, no action
+                if t.language in allowed:
+                    return None
+                # Speaker majority, if confident and in allowed set
+                if args.enforce_lang_by_speaker:
+                    maj, frac = spk_major.get(t.speaker, ("und", 0.0))
+                    if maj in allowed and frac >= float(args.enforce_lang_threshold):
+                        return maj
+                # Quick guess from text
+                g = _guess_target_lang(t.text)
+                if g in allowed:
+                    return g
+                # Last resort: try both and pick best
+                return "both"
+
+            def _langid_score(txt: str, expect: str) -> float:
+                if not txt.strip():
+                    return -1.0
+                lbl, sc = langid.classify(txt)
+                return sc if lbl == expect else -sc  # penalize mismatches
+
+            budget_total = float(args.redecode_max_total_sec)
+            max_seg = float(args.redecode_max_seg_sec)
+            pad = max(0.0, float(args.redecode_pad))
+
+            new_turns: List[Turn] = []
+            for t in turns:
+                target = _decide_target_for_turn(t) if args.redecode_offlang or args.enforce_lang_by_speaker else None
+                if not target:
+                    new_turns.append(t)
+                    continue
+
+                seg_len = max(0.0, t.end - t.start)
+                if seg_len <= 0.0 or seg_len > max_seg:
+                    new_turns.append(t)
+                    continue
+                if (redecode_seconds_spent + seg_len) > budget_total:
+                    new_turns.append(t)
+                    continue
+
+                s0 = max(0.0, t.start - pad)
+                e0 = t.end + pad
+
+                if target in ("ja", "es"):
+                    txt_new = _force_transcribe_window(
+                        shared_model, working_input, s0, e0, target,
+                        beam_size=int(params.get("beam_size", args.beam_size)),
+                        condition_on_previous_text=bool(params.get("condition_on_previous_text", not args.no_condition_on_previous_text)),
+                        initial_prompt=params.get("initial_prompt", args.initial_prompt)
+                    )
+                    if txt_new.strip():
+                        t.text = txt_new
+                        t.language, t.lang_score = detect_language_for_text(txt_new)
+                        rescued_turns_count += 1
+                        redecode_seconds_spent += seg_len
+                    new_turns.append(t)
+                    continue
+
+                # target == "both": try JA and ES, pick by langid score (+small JP-char bonus)
+                best_txt = None; best_lang = None; best_score = -1e9
+                for lang_try in ("ja", "es"):
+                    txt_try = _force_transcribe_window(
+                        shared_model, working_input, s0, e0, lang_try,
+                        beam_size=int(params.get("beam_size", args.beam_size)),
+                        condition_on_previous_text=bool(params.get("condition_on_previous_text", not args.no_condition_on_previous_text)),
+                        initial_prompt=params.get("initial_prompt", args.initial_prompt)
+                    )
+                    score = _langid_score(txt_try, lang_try)
+                    if lang_try == "ja" and looks_japanese(txt_try):
+                        score += 0.25  # tie-break toward JP if CJK present
+                    if score > best_score:
+                        best_score = score; best_txt = txt_try; best_lang = lang_try
+
+                if best_txt and best_txt.strip():
+                    t.text = best_txt
+                    t.language, t.lang_score = detect_language_for_text(best_txt)
+                    rescued_turns_count += 1
+                    redecode_seconds_spent += seg_len
+                new_turns.append(t)
+
+            turns = new_turns
+
+        # --- Metrics (after any rescue)
         metrics = _compute_metrics(asr_segments, turns)
 
-        # Meta per run
+        # --- Meta per run
         total_seconds = asr_seconds + diar_seconds
         meta = {
             "experiment_id": exp_id,
@@ -1144,6 +1480,14 @@ def main():
                 "no_speech_threshold": params.get("no_speech_threshold", args.no_speech_threshold),
                 "initial_prompt": bool(params.get("initial_prompt", args.initial_prompt)),
                 "use_denoised": using_denoised and denoised_available,
+                # Language rescue knobs
+                "allowed_languages": (args.allowed_languages or "ja,es"),
+                "redecode_offlang": bool(args.redecode_offlang),
+                "redecode_pad": float(args.redecode_pad),
+                "redecode_max_seg_sec": float(args.redecode_max_seg_sec),
+                "redecode_max_total_sec": float(args.redecode_max_total_sec),
+                "enforce_lang_by_speaker": bool(args.enforce_lang_by_speaker),
+                "enforce_lang_threshold": float(args.enforce_lang_threshold),
             },
             "input": str(in_path),
             "used_input": working_input,
@@ -1164,7 +1508,11 @@ def main():
                 "transcribe_seconds": round(asr_seconds, 3),
                 "diarization_seconds": round(diar_seconds, 3),
                 "total_seconds": round(total_seconds, 3),
-                **metrics
+                **metrics,
+                # Rescue stats
+                "rescued_turns": int(rescued_turns_count),
+                "redecode_seconds_budget": float(args.redecode_max_total_sec),
+                "redecode_seconds_spent": round(redecode_seconds_spent, 3),
             },
             "versions": {
                 "python": sys.version.split()[0],
@@ -1176,12 +1524,13 @@ def main():
             }
         }
 
-        # Globals for study translate
+        # Make study translate flag visible to writer
         globals()["_STUDY_TRANSLATE"] = not args.no_study_translate
 
+        # --- Write per-run outputs
         _write_outputs(exp_id, turns, meta)
 
-        # Row for experiments summary
+        # --- Add to experiments summary
         summary_rows.append({
             "experiment_id": exp_id,
             "beam_size": int(params.get("beam_size", args.beam_size)),
@@ -1203,6 +1552,9 @@ def main():
             "wpm_over_spoken_time": meta["metrics"]["wpm_over_spoken_time"],
             "majority_language": meta["metrics"]["majority_language"],
             "language_consistency": meta["metrics"]["language_consistency"],
+            # Rescue columns
+            "rescued_turns": int(rescued_turns_count),
+            "redecode_seconds_spent": round(redecode_seconds_spent, 3),
         })
 
         return turns, meta
@@ -1233,7 +1585,6 @@ def main():
     majority_lang, lang_frac = _majority_language(baseline_turns)
     auto_prompt = _extract_domain_terms(baseline_turns, max_terms=25)
 
-    # start from a copy of baseline and override
     H_list = []
 
     # H1: wider beam + patience
@@ -1267,7 +1618,6 @@ def main():
 
     # H9: domain priming with auto prompt
     if auto_prompt:
-        # keep short to avoid biasing too hard
         short_prompt = ", ".join(auto_prompt.split(", ")[:20])
         H_list.append({**baseline_params, "initial_prompt": short_prompt})
 
@@ -1300,7 +1650,6 @@ def main():
     # ---- Experiments summary CSV
     summary_csv_path = Path(f"{base}{args.suffix}_experiments.csv")
     df = pd.DataFrame(summary_rows)
-    # robust write
     _atomic_write_text(summary_csv_path, df.to_csv(index=False))
 
     # Print human summary
@@ -1313,7 +1662,7 @@ def main():
 
     # Global timing
     print("\nSummary (script-level):")
-    print(f"  Experiments run : {n}")
+    print(f"  Experiments run : {len(all_outputs)}")
     print(f"  Total runtime   : {time.perf_counter() - _t0_total_script:.2f}s")
 
     # Cleanup temp
